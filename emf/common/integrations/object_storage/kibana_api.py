@@ -287,8 +287,35 @@ def get_saved_object_by_id(saved_object_id: str,
                                 export_endpoint=export_endpoint)
 
 
-def get_saved_object_by_name(saved_object_title: str,
-                             object_type: SavedObjectType = SavedObjectType.DASHBOARD,
+def get_list_of_objects_by_ids_and_types(input_objects: list,
+                                         kibana_url: str = PY_FROM_KIBANA_URL,
+                                         space_id: str = PY_SPACE_ID,
+                                         export_endpoint: str = PY_EXPORT_OBJECT_ENDPOINT,
+                                         include_references_deep: bool = PY_INCLUDE_REFERENCES_DEEP,
+                                         exclude_export_details: bool = PY_EXCLUDE_EXPORT_DETAILS):
+    """
+    Gets objects by their types and ids
+    :param input_objects: list of input objects (dictionaries). Note that at least type and id must be present
+    :param kibana_url: url of kibana
+    :param space_id: space id if used
+    :param export_endpoint: api endpoint
+    :param include_references_deep: include all references
+    :param exclude_export_details: exclude export report
+    :return: ndjson as string
+    """
+    # Repackage the parameters (just in case)
+    saved_objects_params = [{"type": element.get("type"), "id": element.get("id")} for element in input_objects]
+    saved_objects = compose_export_request_body(saved_objects=saved_objects_params,
+                                                include_references_deep=include_references_deep,
+                                                exclude_export_details=exclude_export_details)
+    return export_saved_objects(kibana_url=kibana_url,
+                                export_content=saved_objects,
+                                space_id=space_id,
+                                export_endpoint=export_endpoint)
+
+
+def get_saved_object_by_name(saved_object_title: str | list,
+                             object_type: SavedObjectType = SavedObjectType.ALL_OBJECTS,
                              kibana_url: str = PY_FROM_KIBANA_URL,
                              space_id: str = PY_SPACE_ID,
                              export_endpoint: str = PY_EXPORT_OBJECT_ENDPOINT,
@@ -311,49 +338,94 @@ def get_saved_object_by_name(saved_object_title: str,
                                                      export_endpoint=export_endpoint,
                                                      object_type=object_type,
                                                      include_references_deep=False,
-                                                     exclude_export_details=False)
+                                                     exclude_export_details=True)
     all_elements = ndjson_to_dict(all_elements)
-    match = next((element for element in all_elements
-                  if element.get('attributes', {}).get('title') == saved_object_title), None)
-    if match:
-        saved_object = get_saved_object_by_id(saved_object_id=match.get('id'),
-                                              object_type=object_type,
-                                              kibana_url=kibana_url,
-                                              space_id=space_id,
-                                              export_endpoint=export_endpoint,
-                                              include_references_deep=include_references_deep,
-                                              exclude_export_details=exclude_export_details)
-        return saved_object
+    if isinstance(saved_object_title, str):
+        saved_object_title = [saved_object_title]
+    matches = [element for element in all_elements
+               if any(element.get('attributes', {}).get('title') == match for match in saved_object_title)]
+    if matches:
+        return get_list_of_objects_by_ids_and_types(input_objects=matches,
+                                                    kibana_url=kibana_url,
+                                                    space_id=space_id,
+                                                    export_endpoint=export_endpoint,
+                                                    include_references_deep=include_references_deep,
+                                                    exclude_export_details=exclude_export_details)
     return None
 
 
-def get_all_elements_by_tag(tag_name: str):
+def get_tag_ids(tags: str | list = None):
     """
-    Example to get all saved_objects which refer to the tag:
-    1) Get tag id by name
-    2) Get all elements, filter them which have the id of the tag in the reference
-    3) Get ids and types of filtered elements
-    4) Query those elements with all dependencies included
-    :param tag_name: name of the tag (string)
+    Gets tag ids as list
+    :param tags: tag name(s)
+    :return: dictionary where tag names are keys and ids are values
+    """
+    tag_ids = {}
+    if isinstance(tags, str):
+        tags = [tags]
+    if all_tags := ndjson_to_dict(get_list_of_saved_objects_by_type(object_type=SavedObjectType.TAG,
+                                                                    include_references_deep=False)):
+        for given_tag in tags:
+            if found_tag := next((tag for tag in all_tags if tag.get('attributes', {}).get('name') == given_tag), None):
+                tag_ids[given_tag] = found_tag.get('id')
+    return tag_ids
+
+
+def get_all_elements_by_tags(included_tags: str | list = None,
+                             excluded_tags: str | list = None,
+                             object_type: SavedObjectType = SavedObjectType.ALL_OBJECTS,
+                             kibana_url: str = PY_FROM_KIBANA_URL,
+                             space_id: str = PY_SPACE_ID,
+                             export_endpoint: str = PY_EXPORT_OBJECT_ENDPOINT,
+                             include_references_deep: bool = PY_INCLUDE_REFERENCES_DEEP,
+                             exclude_export_details: bool = PY_EXCLUDE_EXPORT_DETAILS):
+    """
+    Example to get all saved_objects and filter them by tags
+    1) Get included tag ids and excluded tag ids
+    2) Get all elements without dependencies (references)
+    3) Include elements which have dependency with id in included tag ids
+    4) Exclude out elements which have dependency with id in excluded tag ids
+    :param included_tags: tag names that are included for export
+    :param excluded_tags: tag names that are excluded for export
+    :param kibana_url: url of kibana
+    :param space_id: space id if used
+    :param export_endpoint: api endpoint
+    :param object_type: saved object type specified
+    :param include_references_deep: include all references
+    :param exclude_export_details: exclude export report
     :return: saved objects or none
     """
-    if tags := ndjson_to_dict(get_list_of_saved_objects_by_type(object_type=SavedObjectType.TAG,
-                                                                include_references_deep=False)):
-        if tag := next((tag for tag in tags if tag.get('attributes', {}).get('name') == tag_name), None):
-            tag_id = tag.get('id')
-            all_elements = ndjson_to_dict(get_list_of_saved_objects_by_type(object_type=SavedObjectType.ALL_OBJECTS,
-                                                                            include_references_deep=False))
-            if all_elements:
-                objects = []
-                for element in all_elements:
-                    references = element.get('references')
-                    if next((reference for reference in references if reference.get('id') == tag_id), None):
-                        objects.append({"type": element.get("type"), "id": element.get("id")})
-                response_body = compose_export_request_body(saved_objects=objects,
-                                                            include_references_deep=True,
-                                                            exclude_export_details=True)
-                final_response = export_saved_objects(export_content=response_body)
-                return final_response
+    included_tag_ids = get_tag_ids(tags=included_tags)
+    excluded_tag_ids = get_tag_ids(tags=excluded_tags)
+    filtered_elements = []
+    all_elements_response = get_list_of_saved_objects_by_type(object_type=object_type,
+                                                              kibana_url=kibana_url,
+                                                              space_id=space_id,
+                                                              export_endpoint=export_endpoint,
+                                                              include_references_deep=False,
+                                                              exclude_export_details=True)
+    if all_elements := ndjson_to_dict(all_elements_response):
+        if included_tag_ids:
+            included_elements = [element for element in all_elements
+                                 if any(reference for reference in element.get("references", {})
+                                        if reference and
+                                        any(reference.get('id') == tag_id for tag_id in included_tag_ids.values()))]
+        else:
+            included_elements = all_elements
+        if excluded_tag_ids:
+            filtered_elements = [element for element in included_elements
+                                 if not any(reference for reference in element.get("references", {})
+                                            if reference and
+                                            any(reference.get('id') == tag_id for tag_id in excluded_tag_ids.values()))]
+        else:
+            filtered_elements = included_elements
+    if filtered_elements:
+        return get_list_of_objects_by_ids_and_types(input_objects=filtered_elements,
+                                                    kibana_url=kibana_url,
+                                                    space_id=space_id,
+                                                    export_endpoint=export_endpoint,
+                                                    include_references_deep=include_references_deep,
+                                                    exclude_export_details=exclude_export_details)
     return None
 
 
@@ -367,25 +439,8 @@ if __name__ == '__main__':
     migrate_object_name = PY_SAVED_OBJECT_NAME
     from_kibana = PY_FROM_KIBANA_URL
     to_kibana = PY_TO_KIBANA_URL
-    # file_name = './migrate_object.ndjson'
-    # 1. Get everything
-    # all_stuff = get_list_of_saved_objects_by_type(kibana_url=from_kibana,
-    #                                               object_type=SavedObjectType.ALL_OBJECTS)
-    # all_stuff = ndjson_to_dict(all_stuff)
-    # object_types = set(saved_object.get('type') for saved_object in all_stuff)
-    # logger.info(f"{from_kibana} contains {len(all_stuff)} saved_objects, these are: {','.join(object_types)}")
-    # 2. Get some types
-    some_things = get_list_of_saved_objects_by_type(kibana_url=from_kibana,
-                                                    object_type=[SavedObjectType.TAG],
-                                                    include_references_deep=True)
-    some_things = ndjson_to_dict(some_things)
-
-    # only_boards = [element for element in some_things if element.get("type") == SavedObjectType.DASHBOARD.value]
-    # only_indices = [element for element in some_things if element.get("type") == SavedObjectType.INDEX_PATTERN.value]
-    # logger.info(f"Got {len(only_boards)} {SavedObjectType.DASHBOARD.value}s, "
-    #             f"{len(only_indices)} {SavedObjectType.INDEX_PATTERN.value}s, "
-    #             f"in total {len(some_things)} objects")
-    # 3. Get all dashboards
+    file_name = './migrate_object.ndjson'
+    # 1. Get all dashboards
     # dashboards_bare = get_list_of_saved_objects_by_type(kibana_url=from_kibana,
     #                                                     object_type=SavedObjectType.DASHBOARD,
     #                                                     include_references_deep=False)
@@ -395,24 +450,29 @@ if __name__ == '__main__':
     # dashboards_full = ndjson_to_dict(dashboards_full)
     # logger.info(f"{from_kibana} contains {len(dashboards_bare)} dashboards, "
     #             f"along with {len(dashboards_full) - len(dashboards_bare)} dependencies")
-    # 4. Get dashboard by its id
+    # 2. Get dashboard by its id
     # random_dashboard_id = 'f27bb190-233b-11ef-b23f-295bc02b62e3'
     # random_dashboard = get_saved_object_by_id(kibana_url=from_kibana,
     #                                           saved_object_id=random_dashboard_id,
     #                                           object_type=SavedObjectType.DASHBOARD)
     # random_dashboard = ndjson_to_dict(random_dashboard)
     # print(random_dashboard)
-    # 5. Get dashboard by its name
-    dashboard_name = 'EMFOS TASKS'
-    tasks_dashboard = get_saved_object_by_name(kibana_url=from_kibana,
-                                               object_type=SavedObjectType.DASHBOARD,
-                                               saved_object_title=dashboard_name)
-    tasks_dashboard = ndjson_to_dict(tasks_dashboard)
-    print(tasks_dashboard)
-    emfos_saved_objects = get_all_elements_by_tag("EMFOS")
+    # 3. Get dashboard by its name
+    some_dashboards = ['EMFOS TASKS', 'EMFOS OPDE SCHEDULE', 'EMFOS OPDE MODELS']
+    emfos_dashboards = get_saved_object_by_name(kibana_url=from_kibana,
+                                                object_type=SavedObjectType.DASHBOARD,
+                                                saved_object_title=some_dashboards)
+    emfos_dashboards = ndjson_to_dict(emfos_dashboards)
+    print(emfos_dashboards)
+    # 4. Filter and get elements by included and excluded tags
+    included_tag = "EMFOS"
+    excluded_tag = "draft"
+    emfos_saved_objects = get_all_elements_by_tags(included_tags=included_tag, excluded_tags=excluded_tag)
+    with open(file_name, 'wb') as file_to_write:
+        file_to_write.write(emfos_saved_objects)
     emfos_saved_objects = ndjson_to_dict(emfos_saved_objects)
     print(emfos_saved_objects)
-    # 6. import dashboard to kibana
+    # 7. import dashboard to kibana
     # tasks_dashboard = dict_to_ndjson(tasks_dashboard)
     # response = import_saved_objects(data=tasks_dashboard, kibana_url=from_kibana)
     # print(response.status_code)
