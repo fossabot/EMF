@@ -2,17 +2,16 @@ import ast
 import json
 import logging
 import sys
+import requests
 from enum import Enum
 from http import HTTPMethod, HTTPStatus
 
 import ndjson
-import requests
 
 import config
-from emf.common.config_parser import parse_app_properties
 
 # from common import save_content_to_local_storage, load_content_from_local_storage
-
+from emf.common.config_parser import parse_app_properties
 
 logger = logging.getLogger(__name__)
 
@@ -54,18 +53,7 @@ def send_prepared_request(method_name: HTTPMethod,
     return response
 
 
-class SavedObjectType(Enum):
-    """
-    Extend this
-    """
-    DASHBOARD = 'dashboard'
-    INDEX_PATTERN = 'index-pattern'
-    LENS = 'lens'
-    SEARCH = 'search'
-    TAG = 'tag'
-    VISUALIZATION = 'visualization'
-    ALL_OBJECTS = '*'
-
+class CustomEnum(Enum):
     def __str__(self):
         return self.value
 
@@ -78,12 +66,44 @@ class SavedObjectType(Enum):
             raise ValueError(f"{value} is not recognised {cls.__name__} type")
 
 
+class SavedObjectType(CustomEnum):
+    """
+    Extend this
+    """
+    DASHBOARD = 'dashboard'
+    INDEX_PATTERN = 'index-pattern'
+    LENS = 'lens'
+    SEARCH = 'search'
+    TAG = 'tag'
+    VISUALIZATION = 'visualization'
+    ALL_OBJECTS = '*'
+
+
+class ExportType(CustomEnum):
+    BY_NAME = 'name'
+    BY_TAG = 'tag'
+
+
+def split_string_to_elements(input_string: str, split_element=','):
+    """
+    For parsing string to list
+    :param input_string: input
+    :param split_element: delimiter
+    """
+    elements = input_string.split(split_element)
+    if len(elements) > 1 and len(elements[0]) > 0 and len(elements[-1]) > 0:
+        return [element.strip() for element in elements]
+    return input_string
+
+
 PY_FROM_KIBANA_URL = FROM_KIBANA_URL
 PY_TO_KIBANA_URL = TO_KIBANA_URL
 PY_EXPORT_OBJECT_ENDPOINT = EXPORT_OBJECT_ENDPOINT
 PY_IMPORT_OBJECT_ENDPOINT = IMPORT_OBJECT_ENDPOINT
-PY_SAVED_OBJECT_TYPE = SavedObjectType.value_of(SAVED_OBJECT_TYPE)
-PY_SAVED_OBJECT_NAME = SAVED_OBJECT_NAME
+PY_EXPORT_TYPE = ExportType.value_of(EXPORT_IMPORT_TYPE)
+PY_INCLUDED_OBJECT_NAMES = split_string_to_elements(input_string=INCLUDED_OBJECT_NAMES)
+PY_EXCULDED_OBJECT_NAMES = split_string_to_elements(input_string=EXCLUDED_OBJECT_NAMES)
+
 PY_INCLUDE_REFERENCES_DEEP = json.loads(INCLUDE_REFERENCES_DEEP.lower())
 PY_EXCLUDE_EXPORT_DETAILS = json.loads(EXCLUDE_EXPORT_DETAILS.lower())
 PY_SPACE_ID = ast.literal_eval(SPACE_ID)
@@ -198,13 +218,13 @@ def import_saved_objects(data,
                          compatibility_mode: bool = PY_COMPATIBILITY_MODE):
     """
     Imports saved objects to kibana
-    :data: payload (in ndjson format)
-    :kibana_url: url of location
-    :import_endpoint: api endpoint for import
-    :space_id: id of space where to import (if specified)
-    :create_new_copies: whether to create a new copy (overwrites 'overwrite' and 'compatibility_mode')
-    :overwrite: overwrites the existing one (create_new_copies must be set to False)
-    :compatibility_mode: switch version friendly mode on
+    :param data: payload (in ndjson format)
+    :param kibana_url: url of location
+    :param import_endpoint: api endpoint for import
+    :param space_id: id of space where to import (if specified)
+    :param create_new_copies: whether to create a new copy (overwrites 'overwrite' and 'compatibility_mode')
+    :param overwrite: overwrites the existing one (create_new_copies must be set to False)
+    :param compatibility_mode: switch version friendly mode on
     :return: response code
     """
     import_headers = {'kbn-xsrf': 'true'}
@@ -234,7 +254,8 @@ def import_saved_objects(data,
 def get_list_of_saved_objects_by_type(kibana_url: str = PY_FROM_KIBANA_URL,
                                       space_id: str = PY_SPACE_ID,
                                       export_endpoint: str = PY_EXPORT_OBJECT_ENDPOINT,
-                                      object_type: SavedObjectType | list[SavedObjectType] = PY_SAVED_OBJECT_TYPE,
+                                      object_type: SavedObjectType | list[SavedObjectType] =
+                                      SavedObjectType.ALL_OBJECTS,
                                       include_references_deep: bool = PY_INCLUDE_REFERENCES_DEEP,
                                       exclude_export_details: bool = PY_EXCLUDE_EXPORT_DETAILS):
     """
@@ -314,7 +335,8 @@ def get_list_of_objects_by_ids_and_types(input_objects: list,
                                 export_endpoint=export_endpoint)
 
 
-def get_saved_object_by_name(saved_object_title: str | list,
+def get_saved_object_by_name(included_object_names: str | list = None,
+                             excluded_object_names: str | list = None,
                              object_type: SavedObjectType = SavedObjectType.ALL_OBJECTS,
                              kibana_url: str = PY_FROM_KIBANA_URL,
                              space_id: str = PY_SPACE_ID,
@@ -324,7 +346,8 @@ def get_saved_object_by_name(saved_object_title: str | list,
     """
     Exports saved object by its name (title)
     Note: object_type must be passed along
-    :param saved_object_title: title of saved object
+    :param included_object_names: saved object names
+    :param excluded_object_names: exclude object names
     :param kibana_url: url of kibana
     :param space_id: space id if used
     :param export_endpoint: api endpoint
@@ -333,24 +356,39 @@ def get_saved_object_by_name(saved_object_title: str | list,
     :param exclude_export_details: exclude export report
     :return: ndjson as string
     """
+    if not included_object_names:
+        included_object_names = PY_INCLUDED_OBJECT_NAMES
+    if isinstance(included_object_names, str):
+        included_object_names = [included_object_names]
+    if not excluded_object_names:
+        excluded_object_names = PY_EXCULDED_OBJECT_NAMES
+    if isinstance(excluded_object_names, str):
+        excluded_object_names = [excluded_object_names]
     all_elements = get_list_of_saved_objects_by_type(kibana_url=kibana_url,
                                                      space_id=space_id,
                                                      export_endpoint=export_endpoint,
                                                      object_type=object_type,
                                                      include_references_deep=False,
-                                                     exclude_export_details=True)
+                                                     exclude_export_details=exclude_export_details)
     all_elements = ndjson_to_dict(all_elements)
-    if isinstance(saved_object_title, str):
-        saved_object_title = [saved_object_title]
-    matches = [element for element in all_elements
-               if any(element.get('attributes', {}).get('title') == match for match in saved_object_title)]
+    if included_object_names:
+        matches = [element for element in all_elements
+                   if any(element.get('attributes', {}).get('title') == match for match in included_object_names)]
+    elif excluded_object_names:
+        matches = [element for element in all_elements
+                   if not any(element.get('attributes', {}).get('title') == match for match in excluded_object_names)]
+    else:
+        matches = all_elements
     if matches:
-        return get_list_of_objects_by_ids_and_types(input_objects=matches,
-                                                    kibana_url=kibana_url,
-                                                    space_id=space_id,
-                                                    export_endpoint=export_endpoint,
-                                                    include_references_deep=include_references_deep,
-                                                    exclude_export_details=exclude_export_details)
+        if include_references_deep:
+            return get_list_of_objects_by_ids_and_types(input_objects=matches,
+                                                        kibana_url=kibana_url,
+                                                        space_id=space_id,
+                                                        export_endpoint=export_endpoint,
+                                                        include_references_deep=include_references_deep,
+                                                        exclude_export_details=exclude_export_details)
+        else:
+            return matches
     return None
 
 
@@ -395,6 +433,10 @@ def get_all_elements_by_tags(included_tags: str | list = None,
     :param exclude_export_details: exclude export report
     :return: saved objects or none
     """
+    if not included_tags:
+        included_tags = PY_INCLUDED_OBJECT_NAMES
+    if not excluded_tags:
+        excluded_tags = PY_EXCULDED_OBJECT_NAMES
     included_tag_ids = get_tag_ids(tags=included_tags)
     excluded_tag_ids = get_tag_ids(tags=excluded_tags)
     filtered_elements = []
@@ -403,7 +445,7 @@ def get_all_elements_by_tags(included_tags: str | list = None,
                                                               space_id=space_id,
                                                               export_endpoint=export_endpoint,
                                                               include_references_deep=False,
-                                                              exclude_export_details=True)
+                                                              exclude_export_details=exclude_export_details)
     if all_elements := ndjson_to_dict(all_elements_response):
         if included_tag_ids:
             included_elements = [element for element in all_elements
@@ -420,13 +462,83 @@ def get_all_elements_by_tags(included_tags: str | list = None,
         else:
             filtered_elements = included_elements
     if filtered_elements:
-        return get_list_of_objects_by_ids_and_types(input_objects=filtered_elements,
-                                                    kibana_url=kibana_url,
-                                                    space_id=space_id,
-                                                    export_endpoint=export_endpoint,
-                                                    include_references_deep=include_references_deep,
-                                                    exclude_export_details=exclude_export_details)
+        if include_references_deep:
+            return get_list_of_objects_by_ids_and_types(input_objects=filtered_elements,
+                                                        kibana_url=kibana_url,
+                                                        space_id=space_id,
+                                                        export_endpoint=export_endpoint,
+                                                        include_references_deep=include_references_deep,
+                                                        exclude_export_details=exclude_export_details)
+        else:
+            return filtered_elements
     return None
+
+
+def run_copy_kibana_content(from_kibana_url: str = PY_FROM_KIBANA_URL,
+                            to_kibana_url: str = PY_TO_KIBANA_URL,
+                            space_id: str = PY_SPACE_ID,
+                            export_endpoint: str = PY_EXPORT_OBJECT_ENDPOINT,
+                            import_endpoint: str = PY_IMPORT_OBJECT_ENDPOINT,
+                            include_references_deep: bool = PY_INCLUDE_REFERENCES_DEEP,
+                            exclude_export_details: bool = PY_EXCLUDE_EXPORT_DETAILS,
+                            create_new_copies: bool = PY_CREATE_NEW_COPY,
+                            overwrite: bool = PY_OVERWRITE,
+                            compatibility_mode: bool = PY_COMPATIBILITY_MODE,
+                            export_type: ExportType = PY_EXPORT_TYPE,
+                            included_elements: str | list = None,
+                            excluded_elements: str | list = None):
+    """
+    Function to be used in pipeline to export import objects from one kibana instance to another
+    :param included_elements: saved object names
+    :param excluded_elements: exclude object names
+    :param from_kibana_url: url of kibana from where to copy
+    :param to_kibana_url: url of kibana to where to copy
+    :param space_id: space id if used
+    :param export_endpoint: api endpoint from where to export
+    :param export_type: by tags or by names
+    :param import_endpoint: api endpoint to where to import
+    :param include_references_deep: include all references
+    :param exclude_export_details: exclude export report
+    :param create_new_copies: whether to create a new copy (overwrites 'overwrite' and 'compatibility_mode')
+    :param overwrite: overwrites the existing one (create_new_copies must be set to False)
+    :param compatibility_mode: switch version friendly mode on
+    """
+    if not included_elements:
+        included_elements = PY_INCLUDED_OBJECT_NAMES
+    if not excluded_elements:
+        excluded_elements = PY_EXCULDED_OBJECT_NAMES
+    if not export_type:
+        raise ValueError("Export method not specified")
+    content = None
+    if export_type == ExportType.BY_TAG:
+        content = get_all_elements_by_tags(included_tags=included_elements,
+                                           excluded_tags=excluded_elements,
+                                           kibana_url=from_kibana_url,
+                                           space_id=space_id,
+                                           export_endpoint=export_endpoint,
+                                           include_references_deep=include_references_deep,
+                                           exclude_export_details=exclude_export_details)
+    elif export_type == ExportType.BY_NAME:
+        content = get_saved_object_by_name(included_object_names=included_elements,
+                                           excluded_object_names=excluded_elements,
+                                           kibana_url=from_kibana_url,
+                                           space_id=space_id,
+                                           export_endpoint=export_endpoint,
+                                           include_references_deep=include_references_deep,
+                                           exclude_export_details=exclude_export_details)
+    if not content:
+        raise ValueError("Failed to export")
+    import_response = import_saved_objects(data=content,
+                                           kibana_url=to_kibana_url,
+                                           space_id=space_id,
+                                           import_endpoint=import_endpoint,
+                                           create_new_copies=create_new_copies,
+                                           overwrite=overwrite,
+                                           compatibility_mode=compatibility_mode)
+    if import_response.status_code == HTTPStatus.OK:
+        logger.info(f"Copying {migrate_object_name} from {from_kibana} to {to_kibana} is done")
+    else:
+        logger.warning(f"Unexpected error: {response.status_code}")
 
 
 if __name__ == '__main__':
@@ -436,7 +548,7 @@ if __name__ == '__main__':
         level=logging.INFO,
         handlers=[logging.StreamHandler(sys.stdout)]
     )
-    migrate_object_name = PY_SAVED_OBJECT_NAME
+    migrate_object_name = PY_INCLUDED_OBJECT_NAMES
     from_kibana = PY_FROM_KIBANA_URL
     to_kibana = PY_TO_KIBANA_URL
     file_name = './migrate_object.ndjson'
@@ -461,7 +573,7 @@ if __name__ == '__main__':
     some_dashboards = ['EMFOS TASKS', 'EMFOS OPDE SCHEDULE', 'EMFOS OPDE MODELS']
     emfos_dashboards = get_saved_object_by_name(kibana_url=from_kibana,
                                                 object_type=SavedObjectType.DASHBOARD,
-                                                saved_object_title=some_dashboards)
+                                                included_object_names=some_dashboards)
     emfos_dashboards = ndjson_to_dict(emfos_dashboards)
     print(emfos_dashboards)
     # 4. Filter and get elements by included and excluded tags
@@ -470,9 +582,12 @@ if __name__ == '__main__':
     emfos_saved_objects = get_all_elements_by_tags(included_tags=included_tag, excluded_tags=excluded_tag)
     with open(file_name, 'wb') as file_to_write:
         file_to_write.write(emfos_saved_objects)
-    emfos_saved_objects = ndjson_to_dict(emfos_saved_objects)
-    print(emfos_saved_objects)
+    emfos_saved_objects_as_dict = ndjson_to_dict(emfos_saved_objects)
+    print(emfos_saved_objects_as_dict)
     # 7. import dashboard to kibana
+    # import_response = import_saved_objects(data=emfos_saved_objects,
+    #                                        kibana_url=to_kibana)
+    # print(import_response.status_code)
     # tasks_dashboard = dict_to_ndjson(tasks_dashboard)
     # response = import_saved_objects(data=tasks_dashboard, kibana_url=from_kibana)
     # print(response.status_code)
