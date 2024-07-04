@@ -261,7 +261,7 @@ if __name__ == "__main__":
     existing_time_horizons = ['1D', '2D']
     virtual_time_horizons = ['3D', '4D', '5D', '6D', '7D', '8D', '9D']
     included_models = ['ELERING', 'AST', 'PSE']
-    included_models_from_minio = ['LITGIRD']
+    included_models_from_minio = ['LITGRID']
     some_results = calculate_scenario_datetime_and_time_horizon(given_datetime=current_scenario_date,
                                                                 actual_time_horizons=existing_time_horizons,
                                                                 imaginary_time_horizons=virtual_time_horizons)
