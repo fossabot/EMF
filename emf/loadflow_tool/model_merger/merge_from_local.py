@@ -87,21 +87,24 @@ if __name__ == '__main__':
         level=logging.INFO,
         handlers=[logging.StreamHandler(sys.stdout)]
     )
-
+    # Specify the folder name which to load
     # folder_to_study = 'OPDM_IOP_JULY'
     folder_to_study = 'cgmiopjulyv2'
+    # Specify the path where to look the folder
     examples_path = '../../../loadflow_tool/example_models/'
+    # Add some parameters
     test_time_horizon = '1D'
-    test_tsos = ['ELIA']
     test_scenario_datetime = '2024-07-04T09:30:00+00:00'
     test_version = '002'
     test_merging_area = 'EU'
     test_merging_entity = 'BALTICRSC'
     test_mas = 'http://www.baltic-rsc.eu/OperationalPlanning/CGM'
+    # Load in models
     loaded_models = get_latest_models_and_download(path_to_directory=folder_to_study,
                                                    local_folder_for_examples=examples_path)
     loaded_boundary = get_latest_boundary(path_to_directory=folder_to_study,
                                           local_folder_for_examples=examples_path)
+    # Filter them
     available_models = []
     invalid_models = []
     for model in loaded_models:
@@ -118,7 +121,7 @@ if __name__ == '__main__':
     [print(dict(tso=model['pmd:TSO'], valid=model.get('VALIDATION_STATUS', {}).get('valid'),
                 duration=model.get('VALIDATION_STATUS', {}).get('validation_duration_s'))) for model in
      loaded_models]
-
+    # This part is from RMM, loading files and sending the result is cut
     test_model = merge_models(list_of_models=available_models,
                               latest_boundary=loaded_boundary,
                               time_horizon=test_time_horizon,
@@ -127,11 +130,13 @@ if __name__ == '__main__':
                               merging_entity=test_merging_entity,
                               mas=test_mas,
                               version=test_version)
+    # Save it to local storage
     local_storage = './cgm_merge'
     check_and_create_the_folder_path(local_storage)
     full_name = local_storage.removesuffix('/') + '/' + test_model.name.removeprefix('/')
     with open(full_name, 'wb') as write_file:
         write_file.write(test_model.getbuffer())
+    # Save it to minio
     test_model.name = 'EMF_test_merge_find_better_place/CGM/' + test_model.name
     save_minio_service = minio.ObjectStorage()
     try:
