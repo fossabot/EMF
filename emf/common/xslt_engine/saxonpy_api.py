@@ -12,8 +12,8 @@ from emf.common.config_parser import parse_app_properties
 logger = logging.getLogger(__name__)
 parse_app_properties(globals(), config.paths.xslt_service.xslt)
 
-rabbit_service = rabbit.BlockingClient()
-
+# rabbit_service = rabbit.BlockingClient()
+rabbit_service = None
 
 def do_conversion(channel, method, properties, body: str):
 
@@ -35,7 +35,9 @@ def do_conversion(channel, method, properties, body: str):
 
 
 def run_service():
-
+    global rabbit_service
+    if not rabbit_service:
+        rabbit_service = rabbit.BlockingClient()
     logger.info(f"Shoveling from queue '{RMQ_QUEUE}' to exchange '{RMQ_EXCHANGE}'")
     rabbit_service.shovel(RMQ_QUEUE, RMQ_EXCHANGE, do_conversion)
 
@@ -106,7 +108,8 @@ if __name__ == '__main__':
 
     data = {"XML": xml_bytes.decode(),"XSL": xsl_bytes.decode(), "XSD": xsd_bytes.decode()}
     message_json = json.dumps(data)
-
+    if not rabbit_service:
+        rabbit_service = rabbit.BlockingClient()
     rabbit_service.publish(message_json, 'emfos.xslt')
     print(f"Sending to exchange 'emfos.xslt'")
     time.sleep(2)
