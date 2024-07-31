@@ -112,9 +112,8 @@ class HandlerCreateCGM:
         sv_data = merge_functions.fix_sv_tapsteps(sv_data, ssh_data)
         sv_data = merge_functions.remove_small_islands(sv_data, int(SMALL_ISLAND_SIZE))
         models_as_triplets = merge_functions.load_opdm_data(input_models)
-        sv_data = (merge_functions.
-                   remove_duplicate_voltage_levels_for_topological_nodes(cgm_sv_data=sv_data,
-                                                                         original_data=models_as_triplets))
+        sv_data = merge_functions.remove_duplicate_sv_voltages(cgm_sv_data=sv_data,
+                                                               original_data=models_as_triplets)
         sv_data = merge_functions.check_and_fix_dependencies(cgm_sv_data=sv_data,
                                                              cgm_ssh_data=ssh_data,
                                                              original_data=models_as_triplets)

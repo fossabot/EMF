@@ -410,7 +410,7 @@ def take_best_match_for_sv_voltage(input_data, column_name: str = 'v', to_keep: 
     return first_row
 
 
-def remove_duplicate_voltage_levels_for_topological_nodes(cgm_sv_data, original_data):
+def remove_duplicate_sv_voltages(cgm_sv_data, original_data):
     """
     Pypowsybl 1.6.0 provides multiple sets of SvVoltage values for the topological nodes that are boundary nodes (from
     each IGM side that uses the corresponding boundary node). So this is a hack that removes one of them (preferably the
