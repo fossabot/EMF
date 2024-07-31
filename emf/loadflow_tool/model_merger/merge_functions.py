@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 import config
 from emf.loadflow_tool.helper import load_model, load_opdm_data, filename_from_metadata, attr_to_dict, export_model
 from emf.loadflow_tool import loadflow_settings
@@ -353,6 +355,121 @@ def filter_models(models: list, included_models: list | str = None, excluded_mod
 
     return filtered_models
 
+
+def get_opdm_data_from_models(model_data: list | pandas.DataFrame):
+    """
+    Check if input is already parsed to triplets. Do it otherwise
+    :param model_data: input models
+    :return triplets
+    """
+    if not isinstance(model_data, pandas.DataFrame):
+        model_data = load_opdm_data(model_data)
+    return model_data
+
+
+def get_boundary_nodes_between_igms(model_data: list | pandas.DataFrame):
+    """
+    Filters out nodes that are between the igms (mentioned at least 2 igms)
+    :param model_data: input models
+    : return series of node ids
+    """
+    model_data = get_opdm_data_from_models(model_data=model_data)
+    all_boundary_nodes = model_data[(model_data['KEY'] == 'TopologicalNode.boundaryPoint') &
+                                    (model_data['VALUE'] == 'true')]
+    # Get boundary nodes that exist in igms
+    merged = pandas.merge(all_boundary_nodes,
+                          model_data[(model_data['KEY'] == 'SvVoltage.TopologicalNode')],
+                          left_on='ID', right_on='VALUE', suffixes=('_y', ''))
+    # Get duplicates (all of them) then duplicated values. keep=False marks all duplicates True, 'first' marks first
+    # occurrence to false, 'last' marks last occurrence to false. If any of them is used then in case duplicates are 2
+    # then 1 is retrieved, if duplicates >3 then duplicates-1 retrieved. So, get all the duplicates and as a second
+    # step, drop the duplicates
+    merged = (merged[merged.duplicated(['VALUE'], keep=False)]).drop_duplicates(subset=['VALUE'])
+    in_several_igms = (merged["VALUE"]).to_frame().rename(columns={'VALUE': 'ID'})
+    return in_several_igms
+
+
+def take_best_match_for_sv_voltage(input_data, column_name: str = 'v', to_keep: bool = True):
+    """
+    Returns one row for with sv voltage id for topological node
+    1) Take the first
+    2) If first is zero take first non-zero row if exists
+    :param input_data: input dataframe
+    :param column_name: name of the column
+    :param to_keep: either to keep or discard a value
+    """
+    first_row = input_data.iloc[0]
+    if to_keep:
+        remaining_rows = input_data[input_data[column_name] != 0]
+        if first_row[column_name] == 0 and not remaining_rows.empty:
+            first_row = remaining_rows.iloc[0]
+    else:
+        remaining_rows = input_data[input_data[column_name] == 0]
+        if first_row[column_name] != 0 and not remaining_rows.empty:
+            first_row = remaining_rows.iloc[0]
+    return first_row
+
+
+def remove_duplicate_voltage_levels_for_topological_nodes(cgm_sv_data, original_data):
+    """
+    Pypowsybl 1.6.0 provides multiple sets of SvVoltage values for the topological nodes that are boundary nodes (from
+    each IGM side that uses the corresponding boundary node). So this is a hack that removes one of them (preferably the
+    one that is zero).
+    :param cgm_sv_data: merged SV profile from where duplicate SvVoltage values are removed
+    :param original_data: will be used to get boundary node ids
+    :return updated merged SV profile
+    """
+    # Check that models are in triplets
+    some_data = get_opdm_data_from_models(model_data=original_data)
+    # Get ids of boundary nodes that are shared by several igms
+    in_several_igms = (get_boundary_nodes_between_igms(model_data=some_data))
+    # Get SvVoltage Ids corresponding to shared boundary nodes
+    sv_voltage_ids = pandas.merge(cgm_sv_data[cgm_sv_data['KEY'] == 'SvVoltage.TopologicalNode'],
+                                  in_several_igms.rename(columns={'ID': 'VALUE'}), on='VALUE')
+    # Get SvVoltage voltage values for corresponding SvVoltage Ids
+    sv_voltage_values = pandas.merge(cgm_sv_data[cgm_sv_data['KEY'] == 'SvVoltage.v'][['ID', 'VALUE']].
+                                     rename(columns={'VALUE': 'SvVoltage.v'}),
+                                     sv_voltage_ids[['ID', 'VALUE']].
+                                     rename(columns={'VALUE': 'SvVoltage.SvTopologicalNode'}), on='ID')
+    # Just in case convert the values to numeric
+    sv_voltage_values[['SvVoltage.v']] = (sv_voltage_values[['SvVoltage.v']].apply(lambda x: x.apply(Decimal)))
+    # Group by topological node id and by some logic take SvVoltage that will be dropped
+    voltages_to_discard = (sv_voltage_values.groupby(['SvVoltage.SvTopologicalNode']).
+                           apply(lambda x: take_best_match_for_sv_voltage(input_data=x,
+                                                                          column_name='SvVoltage.v',
+                                                                          to_keep=False), include_groups=False))
+    if not voltages_to_discard.empty:
+        logger.info(f"Removing {len(voltages_to_discard.index)} duplicate voltage levels from boundary nodes")
+        sv_voltages_to_remove = pandas.merge(cgm_sv_data, voltages_to_discard['ID'].to_frame(), on='ID')
+        cgm_sv_data = triplets.rdf_parser.remove_triplet_from_triplet(cgm_sv_data, sv_voltages_to_remove)
+    return cgm_sv_data
+
+
+def check_and_fix_dependencies(cgm_sv_data, cgm_ssh_data, original_data):
+    """
+    Seems that pypowsybl ver 1.6.0 managed to get rid of dependencies in exported file. This gathers them from
+    SSH profiles and from the original models
+    :param cgm_sv_data: merged SV profile that is missing the dependencies
+    :param cgm_ssh_data: merged SSH profiles, will be used to get SSH dependencies
+    :param original_data: original models, will be used to get TP dependencies
+    :return updated merged SV profile
+    """
+    some_data = get_opdm_data_from_models(model_data=original_data)
+    tp_file_ids = some_data[(some_data['KEY'] == 'Model.profile') & (some_data['VALUE'].str.contains('Topology'))]
+
+    ssh_file_ids = cgm_ssh_data[(cgm_ssh_data['KEY'] == 'Model.profile') &
+                                (cgm_ssh_data['VALUE'].str.contains('SteadyStateHypothesis'))]
+    dependencies = pandas.concat([tp_file_ids, ssh_file_ids], ignore_index=True, sort=False)
+    existing_dependencies = cgm_sv_data[cgm_sv_data['KEY'] == 'Model.DependentOn']
+    if existing_dependencies.empty or len(existing_dependencies.index) < len(dependencies.index):
+        logger.info(f"Missing dependencies. Adding {len(dependencies.index)} dependencies to SV profile")
+        full_model_id = cgm_sv_data[(cgm_sv_data['KEY'] == 'Type') & (cgm_sv_data['VALUE'] == 'FullModel')]
+        new_dependencies = dependencies[['ID']].copy().rename(columns={'ID': 'VALUE'}).reset_index(drop=True)
+        new_dependencies.loc[:, 'KEY'] = 'Model.DependentOn'
+        new_dependencies.loc[:, 'ID'] = full_model_id['ID'].iloc[0]
+        new_dependencies.loc[:, 'INSTANCE_ID'] = full_model_id['INSTANCE_ID'].iloc[0]
+        cgm_sv_data = triplets.rdf_parser.update_triplet_from_triplet(cgm_sv_data, new_dependencies)
+    return cgm_sv_data
 
 def remove_small_islands(solved_data, island_size_limit):
     small_island = pandas.DataFrame(solved_data.query("KEY == 'TopologicalIsland.TopologicalNodes'").ID.value_counts()).reset_index().query("count <= @island_size_limit")
