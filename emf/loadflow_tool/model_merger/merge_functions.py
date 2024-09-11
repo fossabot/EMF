@@ -560,30 +560,42 @@ def remove_small_islands(solved_data, island_size_limit):
     return solved_data
 
 
-def disconnect_equipment_if_flow_sum_not_zero(cgm_sv_data,
-                                              cgm_ssh_data,
-                                              original_data,
-                                              equipment_name: str = "ConformLoad",
-                                              sv_injection_limit: float = SV_INJECTION_LIMIT):
+def get_failed_buses(load_flow_results: list, network_instance: pypowsybl.network, fail_types=None):
     """
-    If there is a mismatch of flows at topological nodes it tries to switch of and set flows at terminals
-    indicated by equipment_name to original values.
-    The idea is that when loadflow calculation fails at some island, the results are still being updated and as
-    currently there is not a better way to find the islands-> nodes -> terminals on which it fails then the HACK
-    is to try to set them back to original values.
-    NOTE THAT IT NOT ONLY SETS THE VALUES TO OLD ONES BUT ALSO DISCONNECTS IT FROM TERMINAL
-    :param cgm_ssh_data: merged SSH profile (needed to switch the terminals of)
+    Gets dataframe of failed buses for postprocessing
+    :param load_flow_results: list of load flow results for connected components
+    :param network_instance: network instance to get buses
+    :param fail_types: list of fail types
+    :return dataframe of failed buses
+    """
+    if not fail_types:
+        fail_types = [pypowsybl.loadflow.ComponentStatus.FAILED,
+                      pypowsybl.loadflow.ComponentStatus.NO_CALCULATION]
+    troublesome_buses = pandas.DataFrame([result for result in load_flow_results if result['status'] in fail_types])
+    if not troublesome_buses.empty:
+        troublesome_buses = (network_instance.get_buses().reset_index()
+                             .merge(troublesome_buses
+                                    .rename(columns={'connected_component_num': 'connected_component'}),
+                                    on='connected_component'))
+    return troublesome_buses
+
+
+def get_nodes_against_kirchhoff_first_law(cgm_sv_data,
+                                          original_models,
+                                          sv_injection_limit: float = SV_INJECTION_LIMIT,
+                                          nodes_only: bool = False):
+    """
+    Gets dataframe of nodes in which the sum of flows exceeds the limit
     :param cgm_sv_data: merged SV profile (needed to set the flows for terminals)
-    :param original_data: IGMs (triplets, dictionary)
-    :param equipment_name: name of the equipment. CURRENTLY, IT IS USED FOR CONFORM LOAD
+    :param original_models: IGMs (triplets, dictionary)
+    :param nodes_only: if true then return unique nodes only, if false then nodes with corresponding terminals
     :param sv_injection_limit: threshold for deciding whether the node is violated by sum of flows
-    :return updated merged SV and SSH profiles
     """
-    original_data = get_opdm_data_from_models(model_data=original_data)
+    original_models = get_opdm_data_from_models(model_data=original_models)
     # Get power flow after lf
     power_flow = cgm_sv_data.type_tableview('SvPowerFlow')[['SvPowerFlow.Terminal', 'SvPowerFlow.p', 'SvPowerFlow.q']]
     # Get terminals
-    terminals = original_data.type_tableview('Terminal').rename_axis('Terminal').reset_index()
+    terminals = original_models.type_tableview('Terminal').rename_axis('Terminal').reset_index()
     terminals = terminals[['Terminal', 'Terminal.ConductingEquipment', 'Terminal.TopologicalNode']]
     # Calculate summed flows per topological node
     flows_summed = ((power_flow.merge(terminals, left_on='SvPowerFlow.Terminal', right_on='Terminal', how='left')
@@ -592,39 +604,78 @@ def disconnect_equipment_if_flow_sum_not_zero(cgm_sv_data,
     # Get topological nodes that have mismatch
     nok_nodes = flows_summed[(abs(flows_summed['SvPowerFlow.p']) > sv_injection_limit) |
                              (abs(flows_summed['SvPowerFlow.q']) > sv_injection_limit)][['Terminal.TopologicalNode']]
-    # Merge terminals with summed flows at nodes
+    if nodes_only:
+        return nok_nodes
     terminals_nodes = terminals.merge(flows_summed, on='Terminal.TopologicalNode', how='left')
-    # Get equipment names
-    equipment_names = (original_data.query('KEY == "Type"')[['ID', 'VALUE']]
-                       .drop_duplicates().rename(columns={'ID': 'Terminal.ConductingEquipment',
-                                                          'VALUE': 'Equipment_name'}))
-    # Merge terminals with equipment names
-    terminals_equipment = terminals_nodes.merge(equipment_names, on='Terminal.ConductingEquipment', how='left')
-    # Get equipment lines corresponding to nodes that had mismatch
-    if not nok_nodes.empty:
-        logger.error(f"For {len(nok_nodes.index)} topological nodes, the sum of flows is over {sv_injection_limit}")
-        nok_lines = (terminals_equipment.merge(nok_nodes, on='Terminal.TopologicalNode')
-                     .sort_values(by=['Terminal.TopologicalNode']))
-        nok_loads = nok_lines[nok_lines['Equipment_name'] == equipment_name]
-        if not nok_loads.empty:
-            logger.warning(f"Switching off {len(nok_loads.index)} terminals as they contain {equipment_name}")
-            # Copy values from original models
-            old_power_flows = original_data.type_tableview('SvPowerFlow')[['SvPowerFlow.Terminal',
-                                                                           'SvPowerFlow.p', 'SvPowerFlow.q']]
-            old_power_flows = (old_power_flows
-                               .merge(nok_loads[['Terminal']].rename(columns={'Terminal': 'SvPowerFlow.Terminal'}),
-                                      on='SvPowerFlow.Terminal'))
-            new_power_flows = cgm_sv_data.type_tableview('SvPowerFlow')[['SvPowerFlow.Terminal', 'Type']]
-            new_power_flows = (new_power_flows.reset_index().merge(old_power_flows, on='SvPowerFlow.Terminal')
-                               .set_index('ID'))
-            # Update values in SV profile
-            cgm_sv_data = triplets.rdf_parser.update_triplet_from_tableview(cgm_sv_data, new_power_flows)
-            # Just in case disconnect those things also
-            # The following part can cause 'Disconnected Terminal' error
-            # terminals_in_ssh = cgm_ssh_data[cgm_ssh_data["KEY"].str.contains("Terminal.connected")].merge(
-            #     nok_loads[["Terminal"]].rename(columns={'Terminal': 'ID'}), on='ID')
-            # terminals_in_ssh.loc[:, 'VALUE'] = 'false'
-            # cgm_ssh_data = triplets.rdf_parser.update_triplet_from_triplet(cgm_ssh_data, terminals_in_ssh)
+    terminals_nodes = terminals_nodes.merge(nok_nodes, on='Terminal.TopologicalNode')
+    return terminals_nodes
+
+
+def revert_failed_buses(cgm_sv_data,
+                        cgm_ssh_data,
+                        original_data,
+                        failed_buses: pandas.DataFrame = None,
+                        network_instance: pypowsybl.network = None,
+                        sv_injection_limit: float = SV_INJECTION_LIMIT,
+                        revert_failed_terminals: bool = False):
+    """
+    Reverts back flows in terminals which are located on the buses that were not calculated.
+    To revert the flows back to original state following criteria has to be met:
+    1) Bus state is either "FAILED" ("...considered dead and no calculation is performed...") or NO_CALCULATION
+    2) For terminal there is a difference of power flows when comparing original and merged model
+    3) Terminal is located in the topological node which sum of power flows differs from more than sv_injection_limit
+    :param cgm_sv_data: merged SV profile (needed to set the flows for terminals)
+    :param cgm_ssh_data: merged SSH profile (needed to switch the terminals of)
+    :param original_data: IGMs (triplets, dictionary)
+    :param failed_buses: dataframe of failed buses
+    :param network_instance: pypowsybl network instance
+    :param sv_injection_limit: threshold for deciding whether the node is violated by sum of flows
+    :param revert_failed_terminals: set it true to revert the flows for terminals
+    :return updated merged SV and SSH profiles
+    """
+    # Check that input is triplets
+    original_models = get_opdm_data_from_models(model_data=original_data)
+    # Get terminals merged with nok nodes (see condition 2)
+    nok_nodes = get_nodes_against_kirchhoff_first_law(cgm_sv_data=cgm_sv_data,
+                                                      original_models=original_models,
+                                                      sv_injection_limit=sv_injection_limit)
+    # Filter buses that failed (see condition 1)
+    types = {'status': [pypowsybl.loadflow.ComponentStatus.FAILED, pypowsybl.loadflow.ComponentStatus.NO_CALCULATION]}
+    failed_buses = failed_buses.merge(pandas.DataFrame(types), on='status')
+    # Get terminals from network and merge them with failed buses
+    all_terminals = network_instance.get_terminals().rename_axis('Terminal.ConductingEquipment').reset_index()
+    failed_bus_terminals = all_terminals.merge(failed_buses[['id']].rename(columns={'id': 'bus_id'}), on='bus_id')
+    # Filter terminals that were in buses that failed (not calculated)
+    failed_terminals = (nok_nodes.rename(columns={'Terminal': 'SvPowerFlow.Terminal'})
+                        .merge(failed_bus_terminals, on='Terminal.ConductingEquipment'))
+    if failed_terminals.empty:
+        return cgm_sv_data, cgm_ssh_data
+    # Get power flow differences
+    old_power_flows = original_models.type_tableview('SvPowerFlow')[['SvPowerFlow.Terminal',
+                                                                     'SvPowerFlow.p', 'SvPowerFlow.q']]
+    new_power_flows = cgm_sv_data.type_tableview('SvPowerFlow')
+    power_flow_diff = old_power_flows.merge(new_power_flows[['SvPowerFlow.Terminal', 'SvPowerFlow.p', 'SvPowerFlow.q']],
+                                            on='SvPowerFlow.Terminal', suffixes=('_pre', '_post'))
+    power_flow_diff = power_flow_diff.merge(failed_terminals[['SvPowerFlow.Terminal', 'Terminal.TopologicalNode']],
+                                            on='SvPowerFlow.Terminal')
+    # Filter those terminals which had flows updated (see condition 3)
+    try:
+        power_flow_diff['CHANGED'] = ((abs(power_flow_diff['SvPowerFlow.p_pre']
+                                           - power_flow_diff['SvPowerFlow.p_post'])
+                                       + abs(power_flow_diff['SvPowerFlow.q_pre']
+                                             - power_flow_diff['SvPowerFlow.q_post'])) != 0)
+        power_flow_diff = power_flow_diff[power_flow_diff.eval('CHANGED')]
+    except IndexError:
+        return cgm_sv_data, cgm_ssh_data
+    updated_power_flows = (new_power_flows[['SvPowerFlow.Terminal', 'Type']].reset_index()
+                           .merge(power_flow_diff[['SvPowerFlow.Terminal']], on='SvPowerFlow.Terminal'))
+    updated_power_flows = updated_power_flows.merge(old_power_flows, on='SvPowerFlow.Terminal')
+    logger.error(f"Found flows for {len(power_flow_diff.index)} terminals "
+                 f"in {len(power_flow_diff['Terminal.TopologicalNode'].unique())} TNs "
+                 f"that were updated but not calculated")
+    if revert_failed_terminals:
+        logger.warning(f"Reverted flows for {len(power_flow_diff.index)} terminals")
+        cgm_sv_data = triplets.rdf_parser.update_triplet_from_tableview(cgm_sv_data, updated_power_flows)
     return cgm_sv_data, cgm_ssh_data
 
 

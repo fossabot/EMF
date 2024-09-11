@@ -137,6 +137,9 @@ class HandlerRmmToPdnAndMinio:
 
             # TODO - run other LF if default fails
             solved_model = merge_functions.run_lf(merged_model, loadflow_settings=getattr(loadflow_settings, MERGE_LOAD_FLOW_SETTINGS))
+            network_itself = solved_model["network"]
+            troublesome_buses = merge_functions.get_failed_buses(load_flow_results=merged_model["LOADFLOW_RESULTS"],
+                                                                 network_instance=network_itself)
 
             # Update time_horizon in case of generic ID process type
             if time_horizon.upper() == "ID":
@@ -159,9 +162,11 @@ class HandlerRmmToPdnAndMinio:
             sv_data = merge_functions.check_and_fix_dependencies(cgm_sv_data=sv_data,
                                                                 cgm_ssh_data=ssh_data,
                                                                 original_data=models_as_triplets)
-            sv_data, ssh_data = merge_functions.disconnect_equipment_if_flow_sum_not_zero(cgm_sv_data=sv_data,
-                                                                                        cgm_ssh_data=ssh_data,
-                                                                                        original_data=models_as_triplets)
+            sv_data, ssh_data = merge_functions.revert_failed_buses(cgm_sv_data=sv_data,
+                                                                    cgm_ssh_data=ssh_data,
+                                                                    network_instance=network_itself,
+                                                                    failed_buses=troublesome_buses,
+                                                                    original_data=models_as_triplets)
             # Package both input models and exported CGM profiles to in memory zip files
             serialized_data = merge_functions.export_to_cgmes_zip([ssh_data, sv_data])
 
