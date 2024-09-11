@@ -109,9 +109,11 @@ if __name__ == '__main__':
     message_json = json.dumps(data)
 
     rabbit_service.publish(message_json, 'emfos.xslt')
-    print(f"Sending to exchange 'emfos.xslt'")
+    logger.info(f"Sending to exchange 'emfos.xslt'")
     time.sleep(2)
 
     run_service()
 
-    print('Test finished')
+
+    logger.info('Script finished')
+

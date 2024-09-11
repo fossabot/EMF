@@ -20,18 +20,18 @@ parse_app_properties(caller_globals=globals(), path=config.paths.integrations.el
 
 class Elastic:
 
-    def __init__(self, server=ELK_SERVER, debug=False):
+    def __init__(self, server: str = ELK_SERVER, debug: bool = False):
         self.server = server
         self.debug = debug
         self.client = Elasticsearch(self.server)
 
     @staticmethod
-    def send_to_elastic(index,
-                        json_message,
-                        id=None,
-                        server=ELK_SERVER,
-                        iso_timestamp=None,
-                        debug=False):
+    def send_to_elastic(index: str,
+                        json_message: dict,
+                        id: str = None,
+                        server: str = ELK_SERVER,
+                        iso_timestamp: str = None,
+                        debug: bool = False):
         """
         Method to send single message to ELK
         :param index: index pattern in ELK
@@ -48,21 +48,21 @@ class Elastic:
             iso_timestamp = datetime.datetime.utcnow().isoformat(sep="T")
 
         # Adding timestamp value to message
-        json_message["log_timestamp"] = iso_timestamp
+        json_message["@timestamp"] = iso_timestamp
 
         # Create server url with relevant index pattern
         _index = f"{index}-{datetime.datetime.today():%Y%m}"
         url = f"{server}/{_index}/_doc"
 
         if id:
-            url = f"{server}/{_index}/{id}"
+            url = url + f"/{id}"
 
         # Executing POST to push message into ELK
         if debug:
             logger.debug(f"Sending data to {url}")
-        if json_message.get('args', None):  # TODO revise if this is best solution
+        if json_message.get('args', None):  # TODO revise if this is proper solution
             json_message.pop('args')
-        json_data = json.dumps(json_message, default=str)
+        json_data = json.dumps(json_message, default=str, ensure_ascii=True, skipkeys=True)
         response = requests.post(url=url, data=json_data.encode(), headers={"Content-Type": "application/json"})
         if debug:
             logger.debug(f"ELK response: {response.content}")
@@ -70,13 +70,14 @@ class Elastic:
         return response
 
     @staticmethod
-    def send_to_elastic_bulk(index,
-                             json_message_list,
-                             id_from_metadata=False,
-                             id_metadata_list=ID_FROM_METADATA_FIELDS.split(','),
-                             server=ELK_SERVER,
-                             batch_size=int(BATCH_SIZE),
-                             debug=False):
+    def send_to_elastic_bulk(index: str,
+                             json_message_list: List[dict],
+                             id_from_metadata: bool = False,
+                             id_metadata_list: List[str] | None = None,
+                             server: str = ELK_SERVER,
+                             batch_size: int = int(BATCH_SIZE),
+                             iso_timestamp: str | None = None,
+                             debug: bool = False):
         """
         Method to send bulk message to ELK
         :param index: index pattern in ELK
@@ -85,9 +86,21 @@ class Elastic:
         :param id_metadata_list:
         :param server: url of ELK server
         :param batch_size: maximum size of batch
+        :param iso_timestamp: timestamp to be included in documents
         :param debug: flag for debug mode
         :return:
         """
+
+        # Validate if_metadata_list parameter if id_from_metadata is True
+        if id_from_metadata and id_metadata_list is None:
+            raise Exception(f"Argument id_metadata_list not provided")
+
+        # Creating timestamp value if it is not provided in function call
+        if not iso_timestamp:
+            iso_timestamp = datetime.datetime.utcnow().isoformat(sep="T")
+
+        # Adding timestamp value to messages
+        json_message_list = [{**element, '@timestamp': iso_timestamp} for element in json_message_list]
 
         # Define server url with relevant index pattern (monthly indication is added)
         index = f"{index}-{datetime.datetime.today():%Y%m}"
@@ -114,12 +127,12 @@ class Elastic:
 
         return all(response_list)
 
-    def get_doc_by_id(self, index, id):
+    def get_doc_by_id(self, index: str, id: str):
         response = self.client.get(index=index, id=id)
 
         return response
 
-    def get_docs_by_query(self, index, query, size=None, return_df=True):
+    def get_docs_by_query(self, index: str, query: dict, size: int | None = None, return_df: bool = True):
 
         response = self.client.search(index=index, query=query, size=size)
         if self.debug:
@@ -185,7 +198,7 @@ class HandlerSendToElastic:
                  index: str,
                  server: str = ELK_SERVER,
                  id_from_metadata: bool = False,
-                 id_metadata_list: List[str] = ID_FROM_METADATA_FIELDS.split(','),
+                 id_metadata_list: List[str] | None = None,
                  headers=None,
                  auth=None,
                  verify=False,

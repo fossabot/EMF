@@ -6,23 +6,22 @@ from typing import List
 import json
 
 from emf.common.config_parser import parse_app_properties
-from emf.common.integrations import edx, elastic, opdm, minio
+from emf.common.integrations import elastic, opdm, minio_api
 from emf.common.converters import opdm_metadata_to_json
-from emf.loadflow_tool.validator import validate_model
+from emf.loadflow_tool.model_validator.validator import validate_model
 from emf.loadflow_tool.helper import load_opdm_data
-from emf.loadflow_tool.model_statistics import get_system_metrics
-
 
 logger = logging.getLogger(__name__)
 
 parse_app_properties(caller_globals=globals(), path=config.paths.model_retriever.model_retriever)
+parse_app_properties(caller_globals=globals(), path=config.paths.cgm_worker.validator)
 
 
 class HandlerModelsToMinio:
 
     def __init__(self):
         self.opdm_service = opdm.OPDM()
-        self.minio_service = minio.ObjectStorage()
+        self.minio_service = minio_api.ObjectStorage()
 
     def handle(self, opdm_objects: dict, **kwargs):
         # Load from binary to json
@@ -110,6 +109,8 @@ class HandlerModelsValidator:
         # Get the latest boundary set for validation
         latest_boundary = self.opdm_service.get_latest_boundary()
 
+        logger.info(f"Validation parameters used: {VALIDATION_LOAD_FLOW_SETTINGS}")
+
         # Run network model validation
         for opdm_object in opdm_objects:
             response = validate_model(opdm_objects=[opdm_object, latest_boundary])
@@ -122,7 +123,9 @@ class HandlerMetadataToElastic:
     # TODO might be one generic elastic handler
     """Handler to send OPDM metadata object to Elastic"""
     def __init__(self):
-        self.elastic_service = elastic.HandlerSendToElastic(index=ELK_INDEX, id_from_metadata=True, id_metadata_list=['opde:Id'])
+        self.elastic_service = elastic.HandlerSendToElastic(index=ELK_INDEX,
+                                                            id_from_metadata=True,
+                                                            id_metadata_list=ELK_ID_FROM_METADATA_FIELDS.split(','))
 
     def handle(self, opdm_objects: List[dict], **kwargs):
 
@@ -132,7 +135,7 @@ class HandlerMetadataToElastic:
                 component['opdm:Profile'].pop('DATA')
 
         self.elastic_service.handle(byte_string=json.dumps(opdm_objects, default=str).encode('utf-8'),
-                                  properties=kwargs.get('properties'))
+                                    properties=kwargs.get('properties'))
         logger.info(f"Network model metadata sent to object-storage.elk")
 
         return opdm_objects
@@ -181,12 +184,10 @@ if __name__ == "__main__":
     # transfer_model_meta_from_opde_to_elk()
 
     # Get models from OPDM and store to MINIO
-    from emf.common.integrations import minio
-
     service = elastic.Elastic()
     opdm_object = service.get_doc_by_id(index="models-opde-202309", id='723eb242-686c-42f1-85e3-81d38aab31e0').body['_source']
     opdm_service = opdm.OPDM()
-    minio_service = minio.ObjectStorage()
+    minio_service = minio_api.ObjectStorage()
     updated_opdm_objects = opde_models_to_minio(
         opdm_objects=[opdm_object],
         opdm_service=opdm_service,
