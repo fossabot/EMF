@@ -639,16 +639,19 @@ def revert_failed_buses(cgm_sv_data,
     nok_nodes = get_nodes_against_kirchhoff_first_law(cgm_sv_data=cgm_sv_data,
                                                       original_models=original_models,
                                                       sv_injection_limit=sv_injection_limit)
-    # Filter buses that failed (see condition 1)
     types = {'status': [pypowsybl.loadflow.ComponentStatus.FAILED, pypowsybl.loadflow.ComponentStatus.NO_CALCULATION]}
-    failed_buses = failed_buses.merge(pandas.DataFrame(types), on='status')
-    # Get terminals from network and merge them with failed buses
-    all_terminals = network_instance.get_terminals().rename_axis('Terminal.ConductingEquipment').reset_index()
-    failed_bus_terminals = all_terminals.merge(failed_buses[['id']].rename(columns={'id': 'bus_id'}), on='bus_id')
-    # Filter terminals that were in buses that failed (not calculated)
-    failed_terminals = (nok_nodes.rename(columns={'Terminal': 'SvPowerFlow.Terminal'})
-                        .merge(failed_bus_terminals, on='Terminal.ConductingEquipment'))
-    if failed_terminals.empty:
+    try:
+        # Filter buses that failed (see condition 1)
+        failed_buses = failed_buses.merge(pandas.DataFrame(types), on='status')
+        # Get terminals from network and merge them with failed buses
+        all_terminals = network_instance.get_terminals().rename_axis('Terminal.ConductingEquipment').reset_index()
+        failed_bus_terminals = all_terminals.merge(failed_buses[['id']].rename(columns={'id': 'bus_id'}), on='bus_id')
+        # Filter terminals that were in buses that failed (not calculated)
+        failed_terminals = (nok_nodes.rename(columns={'Terminal': 'SvPowerFlow.Terminal'})
+                            .merge(failed_bus_terminals, on='Terminal.ConductingEquipment'))
+        if failed_terminals.empty:
+            raise Exception                    
+    except Exception:
         return cgm_sv_data, cgm_ssh_data
     # Get power flow differences
     old_power_flows = original_models.type_tableview('SvPowerFlow')[['SvPowerFlow.Terminal',
