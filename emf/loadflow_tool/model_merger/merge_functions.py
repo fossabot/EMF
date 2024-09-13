@@ -612,7 +612,6 @@ def get_nodes_against_kirchhoff_first_law(cgm_sv_data,
 
 
 def revert_failed_buses(cgm_sv_data,
-                        cgm_ssh_data,
                         original_data,
                         failed_buses: pandas.DataFrame = None,
                         network_instance: pypowsybl.network = None,
@@ -625,7 +624,6 @@ def revert_failed_buses(cgm_sv_data,
     2) For terminal there is a difference of power flows when comparing original and merged model
     3) Terminal is located in the topological node which sum of power flows differs from more than sv_injection_limit
     :param cgm_sv_data: merged SV profile (needed to set the flows for terminals)
-    :param cgm_ssh_data: merged SSH profile (needed to switch the terminals of)
     :param original_data: IGMs (triplets, dictionary)
     :param failed_buses: dataframe of failed buses
     :param network_instance: pypowsybl network instance
@@ -652,7 +650,7 @@ def revert_failed_buses(cgm_sv_data,
         if failed_terminals.empty:
             raise Exception                    
     except Exception:
-        return cgm_sv_data, cgm_ssh_data
+        return cgm_sv_data
     # Get power flow differences
     old_power_flows = original_models.type_tableview('SvPowerFlow')[['SvPowerFlow.Terminal',
                                                                      'SvPowerFlow.p', 'SvPowerFlow.q']]
@@ -669,7 +667,7 @@ def revert_failed_buses(cgm_sv_data,
                                              - power_flow_diff['SvPowerFlow.q_post'])) != 0)
         power_flow_diff = power_flow_diff[power_flow_diff.eval('CHANGED')]
     except IndexError:
-        return cgm_sv_data, cgm_ssh_data
+        return cgm_sv_data
     updated_power_flows = (new_power_flows[['SvPowerFlow.Terminal', 'Type']].reset_index()
                            .merge(power_flow_diff[['SvPowerFlow.Terminal']], on='SvPowerFlow.Terminal'))
     updated_power_flows = updated_power_flows.merge(old_power_flows, on='SvPowerFlow.Terminal')
@@ -679,7 +677,7 @@ def revert_failed_buses(cgm_sv_data,
     if revert_failed_terminals:
         logger.warning(f"Reverted flows for {len(power_flow_diff.index)} terminals")
         cgm_sv_data = triplets.rdf_parser.update_triplet_from_tableview(cgm_sv_data, updated_power_flows)
-    return cgm_sv_data, cgm_ssh_data
+    return cgm_sv_data
 
 
 if __name__ == "__main__":

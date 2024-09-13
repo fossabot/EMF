@@ -162,11 +162,10 @@ class HandlerRmmToPdnAndMinio:
             sv_data = merge_functions.check_and_fix_dependencies(cgm_sv_data=sv_data,
                                                                 cgm_ssh_data=ssh_data,
                                                                 original_data=models_as_triplets)
-            sv_data, ssh_data = merge_functions.revert_failed_buses(cgm_sv_data=sv_data,
-                                                                    cgm_ssh_data=ssh_data,
-                                                                    network_instance=network_itself,
-                                                                    failed_buses=troublesome_buses,
-                                                                    original_data=models_as_triplets)
+            sv_data = merge_functions.revert_failed_buses(cgm_sv_data=sv_data,
+                                                          network_instance=network_itself,
+                                                          failed_buses=troublesome_buses,
+                                                          original_data=models_as_triplets)
             # Package both input models and exported CGM profiles to in memory zip files
             serialized_data = merge_functions.export_to_cgmes_zip([ssh_data, sv_data])
 
