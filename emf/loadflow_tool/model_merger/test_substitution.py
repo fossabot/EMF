@@ -10,8 +10,7 @@ import pandas
 from emf.common.integrations.object_storage.file_system import group_files_by_origin, \
     get_one_set_of_igms_from_local_storage, get_one_set_of_boundaries_from_local_storage, \
     save_merged_model_to_local_storage
-from emf.common.integrations.object_storage.file_system_general import check_and_create_the_folder_path, \
-    check_the_folder_path
+from emf.common.integrations.object_storage.file_system_general import check_the_folder_path
 from emf.loadflow_tool.model_merger.merge_from_local import merge_models
 from emf.task_generator.time_helper import parse_duration
 import pytz
@@ -501,6 +500,8 @@ if __name__ == "__main__":
         handlers=[logging.StreamHandler(sys.stdout)]
     )
 
+    merge_prefix = 'RMM'
+    minio_merged_folder = f"EMFOS/{merge_prefix}"
     test_version = '123'
     test_merging_entity = 'BALTICRSC'
     test_merging_area = 'BA'
@@ -514,23 +515,25 @@ if __name__ == "__main__":
     included_models_from_minio = ['LITGRID', 'ELERING', 'AST']
 
     retrieved_WK_files = get_week_ahead_models(bucket_name='opde-confidential-models',
-                                               prefix='RCC_WK_IGMS',
+                                               prefix='IGM',
                                                current_scenario_date=current_scenario_date)
 
     # The 'retrieved_files' list will contain all matching future files with the latest version
     print("\nRetrieved future files with latest versions list:", retrieved_WK_files)
 
-    # The 'retrieved_files' list will contain all matching files
-    print(retrieved_WK_files)
     all_horizons = [*existing_time_horizons, *virtual_time_horizons]
     some_results = calculate_scenario_datetime_and_time_horizon_by_shifts(given_datetime=current_scenario_date,
                                                                           time_horizons=all_horizons,
                                                                           shifts=shift_mapping,
+                                                                          # Change this back, during daytime no next day
+                                                                          # models
                                                                           offset='P0D')
     existing_folder = './existing'
     updated_folder = './updated'
     save_to_local_storage = False
     save_to_minio = False
+    save_cgm_to_minio = True
+    save_cgm_to_local = False
     print(pandas.DataFrame(some_results.values()).to_string())
     special_case_time_horizon = 'WK'
     for result in some_results:
@@ -539,9 +542,16 @@ if __name__ == "__main__":
         old_scenario_date = some_results[result].get('existing_time_scenario')
         new_time_horizon = some_results[result].get('future_time_horizon')
         new_scenario_date = some_results[result].get('future_time_scenario')
+        logger.info(f"Processing {new_scenario_date}")
         # 1. Take all existing models from minio opde-confidential-models/IGM
         wk_file_name = parse_datetime(new_scenario_date).strftime("%Y%m%dT%H%MZ")
-        matching_file_names = [file_name for file_name in retrieved_WK_files if f"{wk_file_name}-WK" in file_name]
+        # take all
+        # matching_file_names = [file_name for file_name in retrieved_WK_files if f"{wk_file_name}-WK" in file_name]
+        # or filter by tso
+        matching_file_names = [file_name for file_name in retrieved_WK_files
+                               if (f"{wk_file_name}-WK" in file_name and
+                                   get_tso_name_from_string(file_name)
+                                   in [*included_models, *included_models_from_minio])]
         weekly_models = []
         filtered_models = []
         # 1.1 Download the models
@@ -550,6 +560,7 @@ if __name__ == "__main__":
                                                                object_name=matching_file_name))
         # 1.2 mark all tsos who's igms were received
         existing_tsos.extend([get_tso_name_from_string(file_name) for file_name in matching_file_names])
+        logger.info(f"WK from MINIO IGM: {', '.join(matching_file_names)}")
         # 2. Get designated models from opde (exclude those that were already received from minio)
         included_models = [tso_name for tso_name in included_models if tso_name not in existing_tsos]
         if included_models:
@@ -562,7 +573,9 @@ if __name__ == "__main__":
                                                         scenario_date=old_scenario_date)
                 filtered_models = filter_models(models, included_models, filter_on='pmd:TSO')
             if filtered_models:
-                existing_tsos.extend([model.get('pmd:TSO') for model in filtered_models])
+                opdm_tsos = [model.get('pmd:TSO') for model in filtered_models]
+                existing_tsos.extend(opdm_tsos)
+                logger.info(f"OPDM: {old_scenario_date}-{old_time_horizon} , GOT {', '.join(opdm_tsos)} ")
         # 3. Get models from opde-confidential-models/IGM, exclude those that were got from OPDE and already are WK
         included_models_from_minio = [tso for tso in included_models_from_minio if tso not in existing_tsos]
         if included_models_from_minio:
@@ -573,7 +586,9 @@ if __name__ == "__main__":
                                                                         prefix='IGM')
             # Add tsos whose models where in 'opde-confidential-models to existing ones
             if minio_models:
-                existing_tsos.extend([minio_model.get('pmd:TSO') for minio_model in minio_models])
+                minio_tsos = [minio_model.get('pmd:TSO') for minio_model in minio_models]
+                existing_tsos.extend(minio_tsos)
+                logger.info(f"MINIO IGM: {old_scenario_date}-{old_time_horizon} , GOT {', '.join(minio_tsos)} ")
                 filtered_models.extend(minio_models)
         # 4. Get models from opde-confidential-models/RCC_WK_IGMS, exclude those found in #1 and #2 and #3
         weekly_tsos = [tso_name for tso_name in included_models_from_minio if tso_name not in existing_tsos]
@@ -584,9 +599,13 @@ if __name__ == "__main__":
                                                                      bucket_name='opde-confidential-models',
                                                                      prefix='RCC_WK_IGMS')
             if week_igms:
-                existing_tsos.extend([minio_model.get('pmd:TSO') for minio_model in week_igms])
-                filtered_models.extend(week_igms)
-        logger.info(f"{result}: found {', '.join(existing_tsos)}")
+                week_tsos = [minio_model.get('pmd:TSO') for minio_model in week_igms]
+                existing_tsos.extend(week_tsos)
+                logger.info(f"MINIO RCC WK IGM: {new_scenario_date}-{new_time_horizon} , GOT {', '.join(week_tsos)}")
+                # Need to decide in which format they come, used here the same approach as the ones in IGM folder
+                # filtered_models.extend(week_igms)
+                weekly_models.extend(week_igms)
+        # logger.info(f"{result}: found {', '.join(existing_tsos)}")
         if filtered_models:
             updated_models = change_change_scenario_date_time_horizon(existing_models=filtered_models,
                                                                       new_time_horizon=new_time_horizon,
@@ -610,13 +629,16 @@ if __name__ == "__main__":
                                   scenario_datetime=new_scenario_date,
                                   merging_area=test_merging_area,
                                   merging_entity=test_merging_entity,
+                                  merge_prefix=merge_prefix,
                                   mas=test_mas,
                                   version=test_version)
-        check_and_create_the_folder_path(existing_folder)
-        full_name = existing_folder.removesuffix('/') + '/' + test_model.name.removeprefix('/')
-        with open(full_name, 'wb') as write_file:
-            write_file.write(test_model.getbuffer())
+        if save_cgm_to_local:
+            check_and_create_the_folder_path(existing_folder)
+            full_name = existing_folder.removesuffix('/') + '/' + test_model.name.removeprefix('/')
+            with open(full_name, 'wb') as write_file:
+                write_file.write(test_model.getbuffer())
+        if save_cgm_to_minio:
+            save_model_to_minio(data=test_model,
+                                subfolder_name=minio_merged_folder,
+                                data_file_name=test_model.name)
         logger.info(f"{new_scenario_date} DONE")
-        # 2024-09-04-20240907T0830Z-WK-ELERING-001.zip
-        # save_models_to_local_storage(models_to_save=updated_models, root_folder=existing_folder)
-        # save_models_to_minio(models_to_save=updated_models, retrieved_wk_files=retrieved_WK_files)
