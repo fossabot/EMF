@@ -107,6 +107,24 @@ def create_sv_and_updated_ssh(merged_model, original_models, scenario_date, time
     # Load SV data
     sv_data = pandas.read_RDF([exported_model])
 
+    # Fix naming
+    contents = zipfile.ZipFile(exported_model)
+
+    naming_strategy = pandas.DataFrame()
+
+    for file_name in contents.namelist():
+        if 'naming_strategy' in file_name:
+            naming_strategy = pandas.read_csv(filepath_or_buffer=BytesIO(contents.read(file_name)), sep=';')
+            break
+    if not naming_strategy.empty:
+        existing_values = sv_data.merge(naming_strategy, left_on='VALUE', right_on='CgmesUuid')
+        existing_values = existing_values[existing_values['IidmId'] != 'unknown']
+        if not existing_values.empty:
+            logger.warning(f"Mapping {len(existing_values.index)} ids back:")
+            print(existing_values[['CgmesUuid', 'IidmId']])
+            existing_values['VALUE'] = existing_values['IidmId']
+            new_existing_values = existing_values[['ID', 'KEY', 'VALUE', 'INSTANCE_ID']]
+            sv_data = triplets.rdf_parser.update_triplet_from_triplet(sv_data, new_existing_values)
     # Update
     sv_data.set_VALUE_at_KEY(key='label', value=filename_from_metadata(opdm_object_meta))
     sv_data = triplets.cgmes_tools.update_FullModel_from_filename(sv_data)
@@ -727,7 +745,7 @@ if __name__ == "__main__":
     solved_model = run_lf(merged_model, loadflow_settings=loadflow_settings.CGM_DEFAULT)
 
     # TODO - get version dynamically form ELK
-    sv_data, ssh_data = create_sv_and_updated_ssh(solved_model, valid_models, time_horizon, version, merging_area, merging_entity, mas)
+    sv_data, ssh_data, _ = create_sv_and_updated_ssh(solved_model, valid_models, time_horizon, version, merging_area, merging_entity, mas)
 
     # Fix SV
     sv_data = fix_sv_shunts(sv_data, valid_models)

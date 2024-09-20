@@ -40,6 +40,12 @@ def do_conversion(channel, method, properties, body: str):
     return channel, method, properties, body
 
 
+def run_service():
+
+    logger.info(f"Shoveling from queue '{RMQ_QUEUE}' to exchange '{RMQ_EXCHANGE}'")
+    rabbit_service.shovel(RMQ_QUEUE, RMQ_EXCHANGE, do_conversion)
+
+
 def xslt30_convert(source_file, stylesheet_file, output_file=None):
     with PySaxonProcessor() as saxon:
         xslt30 = saxon.new_xslt30_processor()
