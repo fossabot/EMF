@@ -13,7 +13,7 @@ import datetime
 from emf.loadflow_tool.helper import load_opdm_data, metadata_from_filename
 from emf.task_generator.time_helper import parse_datetime
 from emf.common.config_parser import parse_app_properties
-from emf.common.integrations import minio
+from emf.common.integrations import minio_api as minio
 from emf.common.integrations.object_storage.models import get_latest_models_and_download
 from emf.loadflow_tool.model_merger.merge_functions import filter_models, export_to_cgmes_zip
 # from rcc_common_tools import minio_api
