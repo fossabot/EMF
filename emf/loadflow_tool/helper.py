@@ -244,6 +244,7 @@ def load_model(opdm_objects: List[dict], parameters: dict = None, skip_default_p
     network = pypowsybl.network.load_from_binary_buffer(
         buffer=package_for_pypowsybl(opdm_objects),
         reporter=import_report,
+        parameters=parameters
         # parameters={
         #     "iidm.import.cgmes.store-cgmes-model-as-network-extension": 'true',
         #     "iidm.import.cgmes.create-active-power-control-extension": 'true',
