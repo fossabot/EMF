@@ -1,3 +1,5 @@
+import zipfile
+
 import config
 from emf.loadflow_tool.helper import load_model, load_opdm_data, filename_from_metadata, attr_to_dict, export_model, parse_pypowsybl_report, get_network_elements
 from emf.loadflow_tool import loadflow_settings
@@ -236,7 +238,10 @@ def create_sv_and_updated_ssh(merged_model, original_models, scenario_date, time
 def fix_sv_shunts(sv_data, original_data):
     """Remove Shunt Sections for EQV Shunts"""
 
-    equiv_shunt = load_opdm_data(original_data, "EQ").query("KEY == 'Type' and VALUE == 'EquivalentShunt'")
+    if not isinstance(original_data, pandas.DataFrame):
+        equiv_shunt = load_opdm_data(original_data, "EQ").query("KEY == 'Type' and VALUE == 'EquivalentShunt'")
+    else:
+        equiv_shunt = original_data.query("KEY == 'Type' and VALUE == 'EquivalentShunt'")
     if len(equiv_shunt) > 0:
         shunts_to_remove = sv_data.merge(
             sv_data.query("KEY == 'SvShuntCompensatorSections.ShuntCompensator'").merge(equiv_shunt.ID, left_on='VALUE',
