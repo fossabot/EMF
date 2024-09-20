@@ -12,8 +12,14 @@ from emf.common.config_parser import parse_app_properties
 logger = logging.getLogger(__name__)
 parse_app_properties(globals(), config.paths.xslt_service.xslt)
 
-# rabbit_service = rabbit.BlockingClient()
-rabbit_service = None
+rabbit_service = rabbit.BlockingClient()
+
+
+def run_service():
+
+    logger.info(f"Shoveling from queue '{RMQ_QUEUE}' to exchange '{RMQ_EXCHANGE}'")
+    rabbit_service.shovel(RMQ_QUEUE, RMQ_EXCHANGE, do_conversion)
+
 
 def do_conversion(channel, method, properties, body: str):
 
@@ -35,9 +41,7 @@ def do_conversion(channel, method, properties, body: str):
 
 
 def run_service():
-    global rabbit_service
-    if not rabbit_service:
-        rabbit_service = rabbit.BlockingClient()
+
     logger.info(f"Shoveling from queue '{RMQ_QUEUE}' to exchange '{RMQ_EXCHANGE}'")
     rabbit_service.shovel(RMQ_QUEUE, RMQ_EXCHANGE, do_conversion)
 
@@ -84,16 +88,17 @@ def validate_xml(input_xml, schema_xml):
     is_valid = schema.validate(document)
     for error in schema.error_log:
         logger.error(error)
-    # if is_valid:
-    #     logger.info(f"XML file is valid")
-    # if not is_valid:
-    #     logger.error(f"XML file is invalid")
+    if is_valid:
+        logger.info(f"XML file is valid")
+    if not is_valid:
+        logger.error(f"XML file is not valid")
 
     return is_valid
 
 
 if __name__ == '__main__':
     # Testing
+    from pathlib import Path
 
     logging.basicConfig(stream=sys.stdout,
                         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -103,17 +108,18 @@ if __name__ == '__main__':
         xml_bytes = file.read()
     with open('IGM_entsoeQAReport_Level_8.xsl', 'rb') as file:
         xsl_bytes = file.read()
-    with open('QAR_v2.6.1.xsd', 'rb') as file:
+    with open(Path(__file__).parent.parent.joinpath('schemas/QAR_v2.6.1.xsd'), 'rb') as file:
         xsd_bytes = file.read()
 
-    data = {"XML": xml_bytes.decode(),"XSL": xsl_bytes.decode(), "XSD": xsd_bytes.decode()}
+    data = {"XML": xml_bytes.decode(), "XSL": xsl_bytes.decode(), "XSD": xsd_bytes.decode()}
     message_json = json.dumps(data)
-    if not rabbit_service:
-        rabbit_service = rabbit.BlockingClient()
+
     rabbit_service.publish(message_json, 'emfos.xslt')
-    print(f"Sending to exchange 'emfos.xslt'")
+    logger.info(f"Sending to exchange 'emfos.xslt'")
     time.sleep(2)
 
     run_service()
 
-    print('Script finished')
+
+    logger.info('Script finished')
+
