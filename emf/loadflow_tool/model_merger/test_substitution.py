@@ -577,11 +577,11 @@ if __name__ == "__main__":
                 existing_tsos.extend(opdm_tsos)
                 logger.info(f"OPDM: {old_scenario_date}-{old_time_horizon} , GOT {', '.join(opdm_tsos)} ")
         # 3. Get models from opde-confidential-models/IGM, exclude those that were got from OPDE and already are WK
-        included_models_from_minio = [tso for tso in included_models_from_minio if tso not in existing_tsos]
-        if included_models_from_minio:
+        minio_model_tsos = [tso for tso in included_models_from_minio if tso not in existing_tsos]
+        if minio_model_tsos:
             minio_models = minio_service.get_latest_models_and_download(time_horizon=old_time_horizon,
                                                                         scenario_datetime=old_scenario_date,
-                                                                        model_entity=included_models_from_minio,
+                                                                        model_entity=minio_model_tsos,
                                                                         bucket_name='opde-confidential-models',
                                                                         prefix='IGM')
             # Add tsos whose models where in 'opde-confidential-models to existing ones
