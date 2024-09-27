@@ -489,6 +489,43 @@ def package_models_for_pypowsybl(list_of_zip: list):
     return all_models, boundaries
 
 
+def get_latest_boundary_from_minio(minio_client: minio.ObjectStorage = None,
+                                   minio_bucket: str = 'opdm-data',
+                                   minio_folder: str = 'CGMES/ENTSOE',
+                                   check_later_versions: bool = True):
+    """
+    A temporary hack to check if minio has later version of boundary data available compared to elastic
+    :param minio_client: instance of minio
+    :param minio_bucket: bucket in minio where models are stored
+    :param minio_folder: prefix (path) in bucket to models
+    :param check_later_versions: if true then check if there are newer models in minio that are not in ELK
+    :return boundary data
+    """
+    latest_elk_boundary = get_latest_boundary()
+    if not check_later_versions:
+        return latest_elk_boundary
+    minio_client = minio_client or minio.ObjectStorage()
+    list_of_files = minio_client.list_objects(bucket_name=minio_bucket,
+                                              prefix=minio_folder,
+                                              recursive=True)
+    file_names = [file_name.object_name for file_name in list_of_files]
+    file_name_frame = pandas.DataFrame([metadata_from_filename(os.path.basename(file_name)) | {'file_name': file_name}
+                                        for file_name in file_names])
+    file_name_frame['pmd:validFrom'] = pandas.to_datetime(file_name_frame['pmd:validFrom'])
+    if file_name_frame['pmd:validFrom'].max() <= parse_datetime(latest_elk_boundary['pmd:validFrom']):
+        return latest_elk_boundary
+    last_set = file_name_frame[file_name_frame['pmd:validFrom'] == file_name_frame['pmd:validFrom'].max()]
+    last_set_models = []
+    for index, row in last_set.iterrows():
+        profile = BytesIO(minio_client.download_object(bucket_name=minio_bucket, object_name=row['file_name']))
+        profile.name = row['file_name']
+        last_set_models.append(profile)
+    models_data, boundary_data = group_files_by_origin(list_of_files=last_set_models)
+    boundaries = [get_one_set_of_boundaries_from_local_storage(file_names=boundary_data[tso]) for tso in boundary_data]
+    if len(boundaries) > 0:
+        return boundaries[0]
+    return latest_elk_boundary
+
 if __name__ == "__main__":
 
     import sys
@@ -621,7 +658,8 @@ if __name__ == "__main__":
         print(len(weekly_models))
         weekly_models, boundary = package_models_for_pypowsybl(list_of_zip=weekly_models)
         if not boundary:
-            boundary = get_latest_boundary()
+            # boundary = get_latest_boundary()
+            boundary = get_latest_boundary_from_minio()
 
         test_model = merge_models(list_of_models=weekly_models,
                                   latest_boundary=boundary,
