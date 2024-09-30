@@ -477,8 +477,8 @@ def merge_models(list_of_models: list,
 
 if __name__ == '__main__':
     import sys
-
-    where_to_store_stuff = r'./CGM_dump'
+    # Specify the location where to store the results (makes folder with date time of the current run)
+    where_to_store_stuff = r'E:\some_user_1\CGM_dump'
     this_run = datetime.now().strftime("%d-%m-%Y_%H-%M-%S")
     where_to_store_stuff = os.path.join(where_to_store_stuff, this_run)
 
@@ -487,44 +487,57 @@ if __name__ == '__main__':
         datefmt='%Y-%m-%dT%H:%M:%S',
         level=logging.INFO,
         handlers=[logging.StreamHandler(sys.stdout),
-                  PyPowsyblLogGatheringHandler(topic_name='cgm_merge',
-                                               send_to_elastic=False,
-                                               upload_to_minio=False,
-                                               logging_policy=PyPowsyblLogReportingPolicy.ALL_ENTRIES,
-                                               print_to_console=False,
-                                               path_to_local_folder=where_to_store_stuff,
-                                               report_level=logging.ERROR)]
-    )
-
+                  # Comment this block ini if pypowsybl logs are needed
+                  # PyPowsyblLogGatheringHandler(topic_name='cgm_merge',
+                  #                              send_to_elastic=False,
+                  #                              upload_to_minio=False,
+                  #                              logging_policy=PyPowsyblLogReportingPolicy.ALL_ENTRIES,
+                  #                              print_to_console=False,
+                  #                              path_to_local_folder=where_to_store_stuff,
+                  #                              report_level=logging.ERROR)
+                  ])
+    # Set this true if local files are used, if this is false then it takes the values in test_scenario_datetime_values
+    # and asks them from ELK+Minio
     use_local = True
+    # if use_local is true specify the path from where to get the IGMs
+    folder_to_study = r'E:\some_user_2\YR_IGM\JAN_2025'
+    # Set this true to if running through validator is needed
     validation_needed = False
+    # If result should be sent to opdm
     send_to_opdm = False
-    examples_path = None
-    folder_to_study = r'IGMS/2024-08-01-12-30-1D'
-    test_time_horizon = 'ID'
-    # test_time_horizon = '1D'
-    # test_time_horizon = '2D'
-
+    # Specify TSOs (as are in file names) who should be included, if empty then all are taken
     included_models = []
+    # Specify TSOs who should be excluded, if empty then none is excluded
     excluded_models = []
+    # if models are taken from ELK+Minio (use_local = False), specify additional TSOs that should be searched from Minio
+    # directly (synchro models)
     local_import_models = []
-    overwrite_local_date_time = True
+    # Specify time_horizon and scenario date
+    test_time_horizon = '1D'
     test_scenario_datetime_values = ['2024-08-01T12:30:00+00:00']
+    # If use_local = True and this is True then it takes scenario date, time horizon from the file names of the IGMs
+    overwrite_local_date_time = True
+    # Specify some additional parameters
     test_version = '123'
     test_merging_entity = 'BALTICRSC'
     test_merging_area = 'EU'
     test_mas = 'http://www.baltic-rsc.eu/OperationalPlanning/CGM'
+    # And now it starts to do something
     for test_scenario_datetime in test_scenario_datetime_values:
         logger.info(f"Executing {test_scenario_datetime}")
         if use_local:
             loaded_boundary = file_system.get_latest_boundary(path_to_directory=folder_to_study,
-                                                              local_folder_for_examples=examples_path)
+                                                              local_folder_for_examples=None)
             valid_models = file_system.get_latest_models_and_download(path_to_directory=folder_to_study,
-                                                                      local_folder_for_examples=examples_path)
+                                                                      local_folder_for_examples=None)
             if overwrite_local_date_time:
                 test_scenario_datetime = valid_models[0].get('pmd:scenarioDate', test_scenario_datetime)
                 test_time_horizon = valid_models[0].get('pmd:timeHorizon', test_time_horizon)
-                if test_time_horizon != '1D' and test_time_horizon != '2D':
+                try:
+                    time_horizon_value = int(test_time_horizon)
+                except ValueError:
+                    time_horizon_value = None
+                if time_horizon_value:
                     test_time_horizon = 'ID'
         else:
             loaded_boundary = models.get_latest_boundary()
