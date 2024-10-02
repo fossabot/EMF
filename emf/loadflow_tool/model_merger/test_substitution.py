@@ -1,12 +1,14 @@
 import logging
 import os
 import re
+from collections.abc import Iterable
 from datetime import datetime
 from io import BytesIO
 from zipfile import ZipFile
 
 import pandas
 
+from emf.common.integrations.elastic import Elastic
 from emf.common.integrations.object_storage.file_system import group_files_by_origin, \
     get_one_set_of_igms_from_local_storage, get_one_set_of_boundaries_from_local_storage, \
     save_merged_model_to_local_storage
@@ -26,7 +28,7 @@ try:
 except ImportError:
     from emf.common.integrations import minio_api as minio
 from emf.common.integrations.object_storage.models import get_latest_models_and_download, get_latest_boundary
-from emf.loadflow_tool.model_merger.merge_functions import filter_models, export_to_cgmes_zip
+from emf.loadflow_tool.model_merger.merge_functions import filter_models, export_to_cgmes_zip, get_opdm_data_from_models
 
 # from rcc_common_tools import minio_api
 
@@ -39,8 +41,10 @@ WINDOWS_SEPARATOR = '\\'
 # Shift mapping logic for future scenario dates
 shift_mapping = {
     # Change these pack
-    '1D': 'P0D',  # Shift for '1D' is +2 days
-    '2D': 'P1D',  # Shift for '2D' is +3 days
+    # '1D': 'P0D',  # Shift for '1D' is +2 days
+    # '2D': 'P1D',  # Shift for '2D' is +3 days
+    '1D': 'P1D',  # Shift for '1D' is +2 days
+    '2D': 'P2D',  # Shift for '2D' is +3 days
     # '1D': 'P2D',  # Shift for '1D' is +2 days
     # '2D': 'P3D',  # Shift for '2D' is +3 days
     '3D': 'P0D',  # Shift for '3D' is 0 days (today)
@@ -56,7 +60,7 @@ shift_mapping = {
 def get_date_from_time_horizon(time_horizon: str):
     """
     Parses number of dates from time horizon
-    :param time_horizon: time horizon as string
+    :param time_horizon: input as string
     """
     if time_horizon in ['1D', '2D', '3D', '4D', '5D', '6D', '7D', '8D', '9D']:
         return time_horizon  # return the original time horizon for use in parse_duration
@@ -78,7 +82,7 @@ def calculate_scenario_datetime_and_time_horizon(given_datetime: str | datetime.
     :param actual_offset: set this from given datetime: to get D1 and today use -P1D
     :param imaginary_offset: use this for calculating the offsets for past scenario dates (-week: -P6D)
     :param actual_time_horizons: time horizons to keep intact
-    :param imaginary_time_horizons: time horizons to be substitute
+    :param imaginary_time_horizons: time horizons to be substituted
     """
     timestamps = {}
     existing_timestamps = {}
@@ -151,7 +155,7 @@ def calculate_scenario_datetime_and_time_horizon_by_shifts(time_horizons: list,
     :param given_time_horizons: time horizons that exists
     :param offset: set this from given datetime: to get D1 and today use -P1D
     :param time_horizons: time horizons to keep intact
-    :param shifts: time horizons to be substitute
+    :param shifts: time horizons to be substituted
     """
     if given_time_horizons is None:
         given_time_horizons = ['1D', '2D']
@@ -227,20 +231,126 @@ def reduced_filename_from_metadata(metadata):
     return file_name
 
 
-def change_change_scenario_date_time_horizon(existing_models: list,
-                                             new_scenario_time: str,
-                                             new_time_horizon: str):
+def get_outage_matches(model_data: pandas.DataFrame, outages: pandas.DataFrame, outage_name_field: str = 'name'):
+    """
+    Some preliminary, bad and funky way to match the outage data to the mRIDs. If considering the filtered
+    opc data most of the elements contained some number and letter combination (LN 321 for example) so get them
+    and search equivalents from all the names in the model.
+    Probably the best solution would be to use some kind of external mapping but it is currently missing
+    :param model_data: necessary IGMs (in triplets)
+    :param outages: dataframe of outage data
+    :param outage_name_field: name of the column in outage data to be used for mapping
+    :return slice of triplets containing the IDs of the elements that are in outage data
+    """
+    model_data = get_opdm_data_from_models(model_data)
+    object_names = model_data[model_data['KEY'] == 'IdentifiedObject.name']
+    # Get word before numeric value
+    word_pattern = r'\b(\w+)\b[\s\-\_]+(?=\d+)'
+    # Get numeric value
+    number_pattern = r'\d+'
+    name_matches = []
+    for index, row in outages.iterrows():
+        outage_name = row[outage_name_field]
+        word_matches = re.findall(word_pattern, outage_name)
+        numeric_matches = re.findall(number_pattern, outage_name)
+        if len(word_matches) != len(numeric_matches):
+            logger.error(f"Multiple different values in opc name: {outage_name}, skipping...")
+            continue
+        matches = []
+        for word, number in zip(word_matches, numeric_matches):
+            matches.extend([word + ' ' + number, word + '-' + number, word + number])
+        name_matches.append(object_names[object_names['VALUE'].str.upper().str.contains('|'.join(matches))])
+    matched_lines = pandas.concat(name_matches)
+    matched_lines = matched_lines.drop_duplicates(subset=['ID', 'VALUE'], keep="first")
+    return matched_lines
+
+
+def update_outages(model_data: pandas.DataFrame, existing_outages: pandas.DataFrame, outages_to_set: pandas.DataFrame):
+    """
+    Links outages to devices in igm, gets difference of the outages from the old scenario date and new scenario date
+    Switches on devices which outages will be expired in future and switches of devices that will go to outages
+    :param model_data: necessary IGMs (in triplets)
+    :param existing_outages: dataframe of outage data for the timestamp from which the model was taken
+    :param outages_to_set: dataframe of outage data for a future timestamp that the model will represent
+    :return updated model_data
+    """
+    model_data = get_opdm_data_from_models(model_data)
+    existing_lines = get_outage_matches(model_data=model_data, outages=existing_outages)
+    updated_lines = get_outage_matches(model_data=model_data, outages=outages_to_set)
+    # Tricky part: get changes
+    changes = existing_lines.merge(updated_lines, on='ID', how='outer', suffixes=('_PRE', '_POST'), indicator=True)
+    # Get those devices that will come to service
+    set_to_service = changes[changes['_merge'] == 'left_only'][['ID']]
+    # Get those devices that will go out of service
+    set_out_of_service = changes[changes['_merge'] == 'right_only'][['ID']]
+    statuses = model_data.type_tableview('SvStatus').reset_index()
+    # Rectify "past" outages
+    if not set_to_service.empty:
+        logger.info(f"Devices coming to service: {len(set_to_service.index)}")
+        to_service_status = statuses.merge(set_to_service.rename(columns={'ID': 'SvStatus.ConductingEquipment'}),
+                                           on='SvStatus.ConductingEquipment')
+        to_service_status['SvStatus.inService'] = 'true'
+        model_data = triplets.rdf_parser.update_triplet_from_tableview(data=model_data,
+                                                                       tableview=to_service_status,
+                                                                       update=True,
+                                                                       add=False)
+    # Set future outages
+    if not set_out_of_service.empty:
+        logger.info(f"Devices going out of service: {len(set_out_of_service.index)}")
+        out_service_status = statuses.merge(set_out_of_service.rename(columns={'ID': 'SvStatus.ConductingEquipment'}),
+                                            on='SvStatus.ConductingEquipment')
+        out_service_status['SvStatus.inService'] = 'false'
+        model_data = triplets.rdf_parser.update_triplet_from_tableview(data=model_data,
+                                                                       tableview=out_service_status,
+                                                                       update=True,
+                                                                       add=False)
+    return model_data
+
+
+def change_change_scenario_date_time_horizon_new(existing_models: list,
+                                                 scenario_time_to_set: str,
+                                                 time_horizon_to_set: str):
     """
     Changes scenario dates and time horizons in the opde models
     :param existing_models: list of opde models
-    :param new_scenario_time: new scenario time to use
-    :param new_time_horizon: new time horizon to use
+    :param scenario_time_to_set: new scenario time to use
+    :param time_horizon_to_set: new time horizon to use
+    :return model data as triplets
     """
-    parsed_scenario_time = parse_datetime(new_scenario_time)
+    parsed_scenario_time = parse_datetime(scenario_time_to_set)
+    new_scenario_string = f"{parsed_scenario_time:%Y-%m-%dT%H:%M:00Z}"
+    # Change to 'WK' if new_time_horizon is between 1D and 9D
+    if time_horizon_to_set in ['1D', '2D', '3D', '4D', '5D', '6D', '7D', '8D', '9D']:
+        time_horizon_to_set = 'WK'
+    model_data = get_opdm_data_from_models(existing_models)
+    # Parse file names to triplets values
+    model_data = triplets.cgmes_tools.update_FullModel_from_filename(model_data)
+    # Update these values
+    model_data.loc[model_data.query('KEY == "Model.scenarioTime"').index, 'VALUE'] = new_scenario_string
+    model_data.loc[model_data.query('KEY == "Model.processType"').index, 'VALUE'] = time_horizon_to_set
+    # Update file names from updated values
+    model_data = triplets.cgmes_tools.update_filename_from_FullModel(model_data)
+    return model_data
+
+
+def change_change_scenario_date_time_horizon(existing_models: list,
+                                             scenario_time_to_set: str,
+                                             time_horizon_to_set: str,
+                                             existing_outages: pandas.DataFrame = None,
+                                             outages_to_set: pandas.DataFrame = None):
+    """
+    Changes scenario dates and time horizons in the opde models
+    :param existing_models: list of opde models
+    :param scenario_time_to_set: new scenario time to use
+    :param time_horizon_to_set: new time horizon to use
+    :param existing_outages: outages that need to be reverted
+    :param outages_to_set: outages to be set
+    """
+    parsed_scenario_time = parse_datetime(scenario_time_to_set)
 
     # Change to 'WK' if new_time_horizon is between 1D and 9D
-    if new_time_horizon in ['1D', '2D', '3D', '4D', '5D', '6D', '7D', '8D', '9D']:
-        new_time_horizon = 'WK'
+    if time_horizon_to_set in ['1D', '2D', '3D', '4D', '5D', '6D', '7D', '8D', '9D']:
+        time_horizon_to_set = 'WK'
 
     for model in existing_models:
         content_reference = None
@@ -253,7 +363,7 @@ def change_change_scenario_date_time_horizon(existing_models: list,
             # Change scenario time in headers
             new_scenario_string = f"{parsed_scenario_time:%Y-%m-%dT%H:%M:00Z}"
             profile.loc[profile.query('KEY == "Model.scenarioTime"').index, 'VALUE'] = new_scenario_string
-            profile.loc[profile.query('KEY == "Model.processType"').index, 'VALUE'] = new_time_horizon
+            profile.loc[profile.query('KEY == "Model.processType"').index, 'VALUE'] = time_horizon_to_set
 
             # Update file names:
             file_names = profile[profile['KEY'] == 'label']
@@ -261,10 +371,15 @@ def change_change_scenario_date_time_horizon(existing_models: list,
                 file_name = file_name_row['VALUE']
                 file_name_meta = metadata_from_filename(file_name)
                 file_name_meta['pmd:validFrom'] = f"{parsed_scenario_time:%Y%m%dT%H%MZ}"
-                file_name_meta['pmd:timeHorizon'] = new_time_horizon  # Apply the 'WK' here
+                file_name_meta['pmd:timeHorizon'] = time_horizon_to_set  # Apply the 'WK' here
                 updated_file_name = reduced_filename_from_metadata(file_name_meta)
                 profile.loc[index, 'VALUE'] = updated_file_name
 
+            # Update outages
+            if (existing_outages is not None) or (outages_to_set is not None):
+                profile = update_outages(model_data=profile,
+                                         existing_outages=existing_outages,
+                                         outages_to_set=outages_to_set)
             profile = triplets.cgmes_tools.update_FullModel_from_filename(profile)
             serialized_data = export_to_cgmes_zip([profile])
             if len(serialized_data) == 1:
@@ -272,11 +387,11 @@ def change_change_scenario_date_time_horizon(existing_models: list,
                 serialized.seek(0)
                 opdm_profile['DATA'] = serialized.read()
                 opdm_profile['pmd:scenarioDate'] = new_scenario_string
-                opdm_profile['pmd:timeHorizon'] = new_time_horizon
+                opdm_profile['pmd:timeHorizon'] = time_horizon_to_set
                 opdm_profile['pmd:fileName'] = serialized.name
                 meta_data = metadata_from_filename(serialized.name)
                 opdm_profile['pmd:content-reference'] = (f"CGMES/"
-                                                         f"{new_time_horizon}/"
+                                                         f"{time_horizon_to_set}/"
                                                          f"{meta_data['pmd:modelPartReference']}/"
                                                          f"{parsed_scenario_time:%Y%m%d}/"
                                                          f"{parsed_scenario_time:%H%M%S}/"
@@ -457,6 +572,10 @@ def get_tso_name_from_string(str_value):
 
 
 def package_models_for_pypowsybl(list_of_zip: list):
+    """
+    Packages input data (BytesIO) into the format that is required for pypowsybl
+    :param list_of_zip: list of data instances
+    """
     all_models = []
     boundaries = []
     list_of_igms = []
@@ -526,6 +645,74 @@ def get_latest_boundary_from_minio(minio_client: minio.ObjectStorage = None,
         return boundaries[0]
     return latest_elk_boundary
 
+
+def get_opc_data(index_name: str = 'filtered_opc*',
+                 opc_start_datetime: datetime.datetime | str = datetime.datetime.today(),
+                 opc_end_datetime: datetime.datetime | str = None,
+                 start_datetime_field_name: str = 'start_date',
+                 end_date_time_field_name: str = 'end_date',
+                 max_query_size: int = 10000):
+    """
+    Checks and gets the version number from elastic
+    Note that it works only if logger.info(f"Publishing {instance_file.name} to OPDM")
+    is used when publishing files to OPDM
+    :param index_name: index from where to search
+    :param opc_start_datetime: datetime instance from where to look, if not set then takes current day
+    :param opc_end_datetime: for period search
+    :param max_query_size: maximum size of query, hopefully 10000 is enough for one timestamp
+    :param start_datetime_field_name: field name that contains start dates
+    :param end_date_time_field_name: field name that contains end dates
+    :return version number as a string
+    """
+    query_components = []
+    # Slice in time: take all outages start before or on the opc_start_datetime and end after or on
+    # opc_end_datetime (if given)/opc_start_datetime
+    if isinstance(opc_start_datetime, datetime.datetime):
+        opc_start_datetime = opc_start_datetime.strftime("%Y-%m-%dT%H:%M:%S")
+    query_components.append({"range": {start_datetime_field_name: {"lte": opc_start_datetime}}})
+    if opc_end_datetime:
+        if isinstance(opc_end_datetime, datetime.datetime):
+            opc_end_datetime = opc_end_datetime.strftime("%Y-%m-%dT%H:%M:%S")
+        query_components.append({"range": {end_date_time_field_name: {"gte": opc_end_datetime}}})
+    else:
+        query_components.append({"range": {end_date_time_field_name: {"gte": opc_start_datetime}}})
+    opc_query = {"bool": {"must": query_components}}
+    elastic_client = Elastic()
+    results = elastic_client.get_docs_by_query(index=index_name, query=opc_query, size=max_query_size)
+    return results
+
+
+def flatten_list(x):
+    if isinstance(x, Iterable) and not isinstance(x, (str, bytes)):
+        return [a for i in x for a in flatten_list(i)]
+    return [x]
+    # for element in element_list:
+    #     if isinstance(element, Iterable) and not isinstance(element, (str, bytes)):
+    #         yield from flatten_list(element)
+    #     else:
+    #         yield element
+    # if isinstance(element_list, collections.Iterable):
+    #     return [a for i in element_list for a in flatten_list(i)]
+    # else:
+    #     return [element_list]
+    # for item in element_list:
+    #     try:
+    #         yield from flatten_list(item)
+    #     except TypeError:
+    #         yield item
+
+
+def filter_opc_data_by_tso(row_data, field_name, tso_eic_codes: dict | list):
+    if isinstance(tso_eic_codes, dict):
+        tso_eic_codes = [*tso_eic_codes.values()]
+    if isinstance(tso_eic_codes, list):
+        tso_eic_codes = flatten_list(tso_eic_codes)
+    else:
+        tso_eic_codes = [tso_eic_codes]
+    eic_code = row_data[field_name].str.upper()
+    return eic_code[:2] in tso_eic_codes
+
+
 if __name__ == "__main__":
 
     import sys
@@ -537,6 +724,11 @@ if __name__ == "__main__":
         handlers=[logging.StreamHandler(sys.stdout)]
     )
 
+    tso_codes = {'ELERING': ['EE', '38'],
+                 'AST': ['LV', '43'],
+                 'LITGRID': ['LT', '41'],
+                 'PSE': ['PL', '19']}
+
     merge_prefix = 'RMM'
     minio_merged_folder = f"EMFOS/{merge_prefix}"
     test_version = '123'
@@ -545,11 +737,17 @@ if __name__ == "__main__":
     test_mas = 'http://www.baltic-rsc.eu/OperationalPlanning/CGM'
 
     minio_service = minio.ObjectStorage()
-    current_scenario_date = "2024-09-18T10:30:00+02:00"
+    current_scenario_date = "2024-09-25T08:30:00+00:00"
     existing_time_horizons = ['1D', '2D']
     virtual_time_horizons = ['3D', '4D', '5D', '6D', '7D', '8D', '9D']
-    included_models = ['PSE']
-    included_models_from_minio = ['LITGRID', 'ELERING', 'AST']
+    included_models = [
+        'PSE'
+    ]
+    included_models_from_minio = [
+        'LITGRID',
+        'ELERING',
+        'AST'
+    ]
 
     retrieved_WK_files = get_week_ahead_models(bucket_name='opde-confidential-models',
                                                prefix='IGM',
@@ -564,13 +762,18 @@ if __name__ == "__main__":
                                                                           shifts=shift_mapping,
                                                                           # Change this back, during daytime no next day
                                                                           # models
-                                                                          offset='P0D')
-    existing_folder = './existing'
-    updated_folder = './updated'
-    save_to_local_storage = False
+                                                                          offset='P0D'
+                                                                          )
+    # existing_folder = './weekly_models'
+    existing_folder = r'E:\margus.ratsep\CGM_dump'
+    current_run = datetime.datetime.now().strftime("%d-%m-%Y_%H-%M-%S")
+    existing_folder = os.path.join(existing_folder, current_run)
+    # existing_folder = './existing'
+
+    save_to_local = False
     save_to_minio = False
-    save_cgm_to_minio = True
-    save_cgm_to_local = False
+    save_cgm_to_minio = False
+    save_cgm_to_local = True
     print(pandas.DataFrame(some_results.values()).to_string())
     special_case_time_horizon = 'WK'
     for result in some_results:
@@ -579,6 +782,17 @@ if __name__ == "__main__":
         old_scenario_date = some_results[result].get('existing_time_scenario')
         new_time_horizon = some_results[result].get('future_time_horizon')
         new_scenario_date = some_results[result].get('future_time_scenario')
+
+        # Go to original data
+        # outage_reports = get_opc_data(opc_start_datetime=new_scenario_date,
+        #                               index_name='opc-report*',
+        #                               start_datetime_field_name='TimeSeries.outage_Period.timeInterval.start',
+        #                               end_date_time_field_name='TimeSeries.outage_Period.timeInterval.end')
+        # outage_tso_codes = [*tso_codes.values()]
+        # outage_tso_codes = flatten_list(outage_tso_codes)
+        # outage_reports_filtered = outage_reports[
+        #     outage_reports['TimeSeries.RegisteredResource.mRID.#text'].str.slice(stop=2).isin(outage_tso_codes)]
+
         logger.info(f"Processing {new_scenario_date}")
         # 1. Take all existing models from minio opde-confidential-models/IGM
         wk_file_name = parse_datetime(new_scenario_date).strftime("%Y%m%dT%H%MZ")
@@ -614,11 +828,11 @@ if __name__ == "__main__":
                 existing_tsos.extend(opdm_tsos)
                 logger.info(f"OPDM: {old_scenario_date}-{old_time_horizon} , GOT {', '.join(opdm_tsos)} ")
         # 3. Get models from opde-confidential-models/IGM, exclude those that were got from OPDE and already are WK
-        minio_model_tsos = [tso for tso in included_models_from_minio if tso not in existing_tsos]
-        if minio_model_tsos:
+        minio_igm_model_tsos = [tso for tso in included_models_from_minio if tso not in existing_tsos]
+        if minio_igm_model_tsos:
             minio_models = minio_service.get_latest_models_and_download(time_horizon=old_time_horizon,
                                                                         scenario_datetime=old_scenario_date,
-                                                                        model_entity=minio_model_tsos,
+                                                                        model_entity=minio_igm_model_tsos,
                                                                         bucket_name='opde-confidential-models',
                                                                         prefix='IGM')
             # Add tsos whose models where in 'opde-confidential-models to existing ones
@@ -644,13 +858,37 @@ if __name__ == "__main__":
                 weekly_models.extend(week_igms)
         # logger.info(f"{result}: found {', '.join(existing_tsos)}")
         if filtered_models:
-            updated_models = change_change_scenario_date_time_horizon(existing_models=filtered_models,
-                                                                      new_time_horizon=new_time_horizon,
-                                                                      new_scenario_time=new_scenario_date)
-
-            for updated_model in updated_models:
-                wk_model_zip = package_wk_model_to_zip(updated_model)
-                if save_to_local_storage:
+            # updated_models = change_change_scenario_date_time_horizon(existing_models=filtered_models,
+            #                                                           time_horizon_to_set=new_time_horizon,
+            #                                                           scenario_time_to_set=new_scenario_date,
+            #                                                           existing_outages=old_filtered_outages,
+            #                                                           outages_to_set=new_filtered_outages)
+            updated_models = change_change_scenario_date_time_horizon_new(existing_models=filtered_models,
+                                                                          time_horizon_to_set=new_time_horizon,
+                                                                          scenario_time_to_set=new_scenario_date)
+            old_filtered_outages = get_opc_data(opc_start_datetime=old_scenario_date)
+            new_filtered_outages = get_opc_data(opc_start_datetime=new_scenario_date)
+            old_filtered_outages = old_filtered_outages.drop_duplicates(subset=['name'], keep='first')
+            new_filtered_outages = new_filtered_outages.drop_duplicates(subset=['name'], keep='first')
+            outage_changes = old_filtered_outages[['name']].merge(new_filtered_outages[['name']],
+                                                                  on='name',
+                                                                  how='outer',
+                                                                  indicator=True)
+            outage_changes = outage_changes[
+                (outage_changes['_merge'] == 'left_only') | (outage_changes['_merge'] == 'right_only')]
+            if not outage_changes.empty:
+                logger.info(f"Following outages must be updated:")
+                print(outage_changes.to_string())
+                updated_models = update_outages(model_data=updated_models,
+                                                existing_outages=old_filtered_outages,
+                                                outages_to_set=new_filtered_outages)
+            updated_serialized_data = export_to_cgmes_zip([updated_models])
+            updated_model_data, _ = group_files_by_origin(list_of_files=updated_serialized_data)
+            for updated_tso in updated_model_data:
+                updated_tso_model = get_one_set_of_igms_from_local_storage(file_data=updated_model_data[updated_tso],
+                                                                           tso_name=updated_tso)
+                wk_model_zip = package_wk_model_to_zip(updated_tso_model)
+                if save_to_local:
                     save_merged_model_to_local_storage(wk_model_zip, local_storage_location=existing_folder)
                 if save_to_minio:
                     save_model_to_minio(data=wk_model_zip, data_file_name=wk_model_zip.name)
