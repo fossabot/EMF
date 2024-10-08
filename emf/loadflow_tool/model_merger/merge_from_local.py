@@ -347,6 +347,58 @@ def get_failed_buses(load_flow_results: list, network_instance: pypowsybl.networ
     return troublesome_buses
 
 
+def check_net_interchanges(cgm_sv_data, cgm_ssh_data, original_models, fix_errors: bool = False):
+    """
+    An attempt to calculate the net interchange 2 values and check them against those provided in ssh profiles
+    :param cgm_sv_data: merged sv profile
+    :param cgm_ssh_data: merged ssh profile
+    :param original_models: original profiles
+    :param fix_errors: injects new calculated flows into merged ssh profiles
+    :return (updated) ssh profiles
+    """
+    original_models = get_opdm_data_from_models(model_data=original_models)
+    control_areas = (original_models.type_tableview('ControlArea')
+                     .rename_axis('ControlArea')
+                     .reset_index())[['ControlArea', 'ControlArea.netInterchange', 'ControlArea.pTolerance',
+                                      'IdentifiedObject.energyIdentCodeEic', 'IdentifiedObject.name']]
+    tie_flows = (original_models.type_tableview('TieFlow')
+                 .rename_axis('TieFlow').rename(columns={'TieFlow.ControlArea': 'ControlArea',
+                                                         'TieFlow.Terminal': 'Terminal'})
+                 .reset_index())[['ControlArea', 'Terminal', 'TieFlow.positiveFlowIn']]
+    tie_flows = tie_flows.merge(control_areas[['ControlArea']], on='ControlArea')
+    terminals = (original_models.type_tableview('Terminal')
+                 .rename_axis('Terminal').reset_index())[['Terminal', 'ACDCTerminal.connected']]
+    tie_flows = tie_flows.merge(terminals, on='Terminal')
+    power_flows_pre = (original_models.type_tableview('SvPowerFlow')
+                       .rename(columns={'SvPowerFlow.Terminal': 'Terminal'})
+                       .reset_index())[['Terminal', 'SvPowerFlow.p']]
+    power_flows_post = (cgm_sv_data.type_tableview('SvPowerFlow')
+                        .rename(columns={'SvPowerFlow.Terminal': 'Terminal'})
+                        .reset_index())[['Terminal', 'SvPowerFlow.p']]
+    tie_flows = tie_flows.merge(power_flows_pre, on='Terminal', how='left')
+    tie_flows = tie_flows.merge(power_flows_post, on='Terminal', how='left',
+                                suffixes=('_pre', '_post'))
+    tie_flows_grouped = ((tie_flows.groupby('ControlArea')[['SvPowerFlow.p_pre', 'SvPowerFlow.p_post']].sum())
+                         .rename_axis('ControlArea').reset_index())
+    tie_flows_grouped = control_areas.merge(tie_flows_grouped, on='ControlArea')
+    tie_flows_grouped['Exceeded'] = (abs(tie_flows_grouped['ControlArea.netInterchange']
+                                         - tie_flows_grouped['SvPowerFlow.p_post']) >
+                                     tie_flows_grouped['ControlArea.pTolerance'])
+    net_interchange_errors = tie_flows_grouped[tie_flows_grouped.eval('Exceeded')]
+    if not net_interchange_errors.empty:
+        logger.error(f"Found {len(net_interchange_errors.index)} possible net interchange_2 problems:")
+        print(net_interchange_errors.to_string())
+        if fix_errors:
+            logger.warning(f"Updating {len(net_interchange_errors.index)} interchanges to new values")
+            new_areas = cgm_ssh_data.type_tableview('ControlArea').reset_index()[['ID',
+                                                                                  'ControlArea.pTolerance', 'Type']]
+            new_areas = new_areas.merge(net_interchange_errors[['ControlArea', 'SvPowerFlow.p_post']]
+                                        .rename(columns={'ControlArea': 'ID',
+                                                         'SvPowerFlow.p_post': 'ControlArea.netInterchange'}), on='ID')
+            cgm_ssh_data = triplets.rdf_parser.update_triplet_from_tableview(cgm_ssh_data, new_areas)
+    return cgm_ssh_data
+
+
 def merge_models(list_of_models: list,
                  latest_boundary: dict,
                  time_horizon: str,
@@ -427,6 +479,10 @@ def merge_models(list_of_models: list,
                                   failed_buses=troublesome_buses,
                                   revert_failed_terminals=True)
 
+    try:
+        ssh_data = check_net_interchanges(cgm_sv_data=sv_data, cgm_ssh_data=ssh_data, original_models=data)
+    except KeyError:
+        logger.error(f"No fields for NetInterchange")
     # Package both input models and exported CGM profiles to in memory zip files
     serialized_data = export_to_cgmes_zip([ssh_data, sv_data])
 
