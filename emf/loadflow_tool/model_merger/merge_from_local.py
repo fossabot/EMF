@@ -544,6 +544,7 @@ def merge_models(list_of_models: list,
                  mas: str,
                  path_local_storage: str = None,
                  version: str = '001',
+                 merge_prefix: str = 'CGM',
                  push_to_opdm: bool = False):
     # Load all selected models
     input_models = list_of_models + [latest_boundary]
@@ -646,7 +647,8 @@ def merge_models(list_of_models: list,
             logging.error(f"""Unexpected error on uploading to OPDM:""", exc_info=True)
 
     # Set RMM name
-    rmm_name = f"CGM_{time_horizon}_{version}_{parse_datetime(scenario_datetime):%Y%m%dT%H%MZ}_{merging_area}_{uuid4()}"
+    rmm_name = (f"{merge_prefix}_{time_horizon}_{version}_{parse_datetime(scenario_datetime):%Y%m%dT%H%MZ}"
+                f"_{merging_area}_{uuid4()}")
     # Exclude following profiles from the IGMS
     # excluded_profiles = ['SV', 'SSH']
     excluded_profiles = []
