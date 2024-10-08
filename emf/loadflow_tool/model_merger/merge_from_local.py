@@ -399,6 +399,142 @@ def check_net_interchanges(cgm_sv_data, cgm_ssh_data, original_models, fix_error
     return cgm_ssh_data
 
 
+def get_pf_mismatch(cgm_sv_data, merged_models, path_local_storage: str = None):
+    """
+    This is for debugging Kirchhoff's 1st law. Proceed with caution, have no idea what or if something here does
+    something
+    :param cgm_sv_data: merged sv profile
+    :param merged_models: input igms
+    :param path_local_storage: where to store csv
+    """
+    # Get power flow after lf
+    power_flow = cgm_sv_data.type_tableview('SvPowerFlow')
+    # Get power flow before lf
+    original_power_flow = merged_models.type_tableview('SvPowerFlow')
+    # merge power flows
+    power_flow_diff = (original_power_flow[['SvPowerFlow.Terminal', 'SvPowerFlow.p', 'SvPowerFlow.q']]
+                       .rename(columns={'SvPowerFlow.p': 'pre.p', 'SvPowerFlow.q': 'pre.q'})
+                       .merge(power_flow[['SvPowerFlow.Terminal', 'SvPowerFlow.p', 'SvPowerFlow.q']]
+                              .rename(columns={'SvPowerFlow.p': 'post.p', 'SvPowerFlow.q': 'post.q'}),
+                              on='SvPowerFlow.Terminal',
+                              how='outer'))
+    # Get terminals
+    terminals = (merged_models.type_tableview('Terminal')
+                 .rename_axis('Terminal').reset_index()
+                 .rename(columns={'IdentifiedObject.name': 'Terminal.name'}))
+    try:
+        terminals = terminals[['Terminal',
+                               'ACDCTerminal.connected',
+                               'ACDCTerminal.sequenceNumber',
+                               'Terminal.name',
+                               'Terminal.ConductingEquipment',
+                               'Terminal.ConnectivityNode',
+                               'Terminal.TopologicalNode']]
+    except Exception:
+        terminals = terminals[['Terminal',
+                               'ACDCTerminal.connected',
+                               'ACDCTerminal.sequenceNumber',
+                               'Terminal.name',
+                               'Terminal.ConductingEquipment',
+                               'Terminal.TopologicalNode']]
+    # Get origins
+    tsos = (merged_models.query('KEY == "Model.modelingAuthoritySet"')[['VALUE', 'INSTANCE_ID']]
+            .rename(columns={'VALUE': 'modelingAuthoritySet'}))
+    topological_node_names = ((merged_models.type_tableview('TopologicalNode')
+                               .rename_axis('Terminal.TopologicalNode')
+                               .reset_index())
+                              .rename(columns={'IdentifiedObject.name': 'TopologicalNode.name',
+                                               'IdentifiedObject.description':
+                                                   'TopologicalNode.description'}))
+    try:
+        topological_node_names = topological_node_names[['Terminal.TopologicalNode',
+                                                         'TopologicalNode.name',
+                                                         'TopologicalNode.description',
+                                                         'TopologicalNode.ConnectivityNodeContainer']]
+    except KeyError:
+        logger.error(f"TopologicalNodes are not tied to connectivityContainers")
+        topological_node_names = topological_node_names[['Terminal.TopologicalNode',
+                                                         'TopologicalNode.name',
+                                                         'TopologicalNode.description', 'ConnectivityNodeContainer']]
+    all_topological_nodes = (merged_models.query('KEY=="Type" and VALUE=="TopologicalNode"')[['ID', 'INSTANCE_ID']]
+                             .rename(columns={'ID': 'Terminal.TopologicalNode'}))
+    all_topological_nodes = all_topological_nodes.merge(topological_node_names, on='Terminal.TopologicalNode',
+                                                        how='left')
+    all_topological_nodes = (all_topological_nodes
+                             .merge(tsos, on='INSTANCE_ID'))[['Terminal.TopologicalNode',
+                                                              'TopologicalNode.name',
+                                                              'TopologicalNode.description',
+                                                              'modelingAuthoritySet']]
+    # Calculate summed flows per topological node
+    flows_summed = ((power_flow_diff.merge(terminals,
+                                           left_on='SvPowerFlow.Terminal',
+                                           right_on='Terminal',
+                                           how='left').groupby('Terminal.TopologicalNode')[['pre.p', 'pre.q',
+                                                                                            'post.p', 'post.q']]
+                     .sum()).rename_axis('Terminal.TopologicalNode').reset_index()
+                    .rename(columns={'pre.p': 'pre.p.sum', 'pre.q': 'pre.q.sum',
+                                     'post.p': 'post.p.sum', 'post.q': 'post.q.sum'}))
+    flows_summed['Flow.exceeded'] = ((abs(flows_summed['post.p.sum']) > SV_INJECTION_LIMIT) |
+                                     (abs(flows_summed['post.q.sum']) > SV_INJECTION_LIMIT))
+    # Check if no Kirchhoff law violations exist in original data
+    pre_nok_nodes = flows_summed[(abs(flows_summed['pre.p.sum']) > SV_INJECTION_LIMIT) |
+                                 (abs(flows_summed['pre.q.sum']) > SV_INJECTION_LIMIT)]
+    if not pre_nok_nodes.empty:
+        print(f"{len(pre_nok_nodes.index)} topological nodes have Kirchhoff first law error")
+    # Divide into ok and nok nodes
+    nok_nodes_full = flows_summed[(abs(flows_summed['post.p.sum']) > SV_INJECTION_LIMIT) |
+                                  (abs(flows_summed['post.q.sum']) > SV_INJECTION_LIMIT)]
+    nok_nodes = nok_nodes_full[['Terminal.TopologicalNode']]
+    ok_nodes = flows_summed.merge(nok_nodes.drop_duplicates(), on='Terminal.TopologicalNode',
+                                  how='left', indicator=True)
+    ok_nodes = ok_nodes[ok_nodes['_merge'] == 'left_only'][['Terminal.TopologicalNode']]
+    # Merge terminals with power flows
+    terminals_flows = terminals.merge(power_flow_diff.rename(columns={'SvPowerFlow.Terminal': 'Terminal'}),
+                                      on='Terminal', how='left')
+    # Merge terminals with summed flows at nodes
+    terminals_nodes = terminals_flows.merge(flows_summed, on='Terminal.TopologicalNode', how='left')
+    # Get equipment names
+    all_names = ((merged_models.query('KEY == "IdentifiedObject.name"')[['ID', 'VALUE']])
+                 .rename(columns={'ID': 'Terminal.ConductingEquipment', 'VALUE': 'ConductingEquipment.name'}))
+    equipment_names = (merged_models.query('KEY == "Type"')[['ID', 'VALUE']]
+                       .drop_duplicates().rename(columns={'ID': 'Terminal.ConductingEquipment',
+                                                          'VALUE': 'ConductingEquipment.Type'}))
+    switches_retain = merged_models.query('KEY == "Switch.retained"')
+    switches_open = merged_models.query('KEY == "Switch.open"')
+    switches_state = (switches_retain[['ID', 'VALUE']]
+                      .rename(columns={'VALUE': 'retained'})
+                      .merge(switches_open[['ID', 'VALUE']]
+                             .rename(columns={'VALUE': 'opened'}), on='ID'))
+    equipment_names = equipment_names.merge(switches_state.rename(columns={'ID': 'Terminal.ConductingEquipment'}),
+                                            on='Terminal.ConductingEquipment', how='left')
+    equipment_names = equipment_names.merge(all_names, on='Terminal.ConductingEquipment', how='left')
+    # Merge terminals with equipment names
+    terminals_equipment = terminals_nodes.merge(equipment_names, on='Terminal.ConductingEquipment', how='left')
+    # Merge terminals with origins
+    terminals_equipment = terminals_equipment.merge(all_topological_nodes, on='Terminal.TopologicalNode', how='left')
+    terminals_equipment = terminals_equipment.sort_values(by=['Terminal.TopologicalNode'])
+    # Get error nodes from report
+    ok_lines = (terminals_equipment.merge(ok_nodes, on='Terminal.TopologicalNode')
+                .sort_values(by=['Terminal.TopologicalNode']))
+    nok_lines = (terminals_equipment.merge(nok_nodes, on='Terminal.TopologicalNode')
+                 .sort_values(by=['Terminal.TopologicalNode']))
+    if not nok_nodes.empty:
+        logger.warning(f"Sum of flows {len(nok_nodes.index)} TN is not zero, containing {len(nok_lines.index)} devices")
+    time_moment_now = datetime.now().strftime("%d-%m-%Y_%H-%M-%S")
+    file_name_all = f"all_lines_from_{time_moment_now}.csv"
+    if path_local_storage:
+        check_and_create_the_folder_path(path_local_storage)
+        file_name_all = path_local_storage.removesuffix('/') + '/' + file_name_all.removeprefix('/')
+    terminals_equipment.to_csv(file_name_all)
+    nok_tsos = (nok_lines.copy(deep=True)[['Terminal.TopologicalNode', 'modelingAuthoritySet']]
+                .drop_duplicates(subset='Terminal.TopologicalNode', keep='last')
+                .groupby('modelingAuthoritySet').size().reset_index(name='NodeCount'))
+    ok_tsos = (ok_lines.copy(deep=True)[['Terminal.TopologicalNode', 'modelingAuthoritySet']]
+               .drop_duplicates(subset='Terminal.TopologicalNode', keep='last')
+               .groupby('modelingAuthoritySet').size().reset_index(name='NodeCount'))
+    return ok_tsos, nok_tsos
+
+
 def merge_models(list_of_models: list,
                  latest_boundary: dict,
                  time_horizon: str,
@@ -406,6 +542,7 @@ def merge_models(list_of_models: list,
                  merging_area: str,
                  merging_entity: str,
                  mas: str,
+                 path_local_storage: str = None,
                  version: str = '001',
                  push_to_opdm: bool = False):
     # Load all selected models
@@ -483,6 +620,17 @@ def merge_models(list_of_models: list,
         ssh_data = check_net_interchanges(cgm_sv_data=sv_data, cgm_ssh_data=ssh_data, original_models=data)
     except KeyError:
         logger.error(f"No fields for NetInterchange")
+
+    try:
+        tsos_ok, tsos_nok = get_pf_mismatch(cgm_sv_data=sv_data, merged_models=data,
+                                            path_local_storage=path_local_storage)
+        if not tsos_nok.empty:
+            logger.warning(f"Following TSOs have Kirchhoff 1st law errors")
+            print(tsos_nok.to_string())
+        else:
+            logger.info(f"No Kirchhoff 1st law errors detected")
+    except Exception as ex_message:
+        logger.error(f"Some error occurred: {ex_message}")
     # Package both input models and exported CGM profiles to in memory zip files
     serialized_data = export_to_cgmes_zip([ssh_data, sv_data])
 
@@ -638,7 +786,7 @@ if __name__ == '__main__':
         if not available_models:
             logger.error("No models to merge :(")
             sys.exit()
-
+        check_and_create_the_folder_path(where_to_store_stuff)
         test_model = merge_models(list_of_models=available_models,
                                   latest_boundary=loaded_boundary,
                                   time_horizon=test_time_horizon,
@@ -647,9 +795,11 @@ if __name__ == '__main__':
                                   merging_entity=test_merging_entity,
                                   mas=test_mas,
                                   version=test_version,
+                                  # Comment this line in if all nodes in csv are needed
+                                  # path_local_storage=where_to_store_stuff,
                                   push_to_opdm=send_to_opdm)
 
-        check_and_create_the_folder_path(where_to_store_stuff)
+
         full_name = where_to_store_stuff.removesuffix('/') + '/' + test_model.name.removeprefix('/')
         with open(full_name, 'wb') as write_file:
             write_file.write(test_model.getbuffer())
