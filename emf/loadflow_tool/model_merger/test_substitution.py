@@ -57,6 +57,10 @@ shift_mapping = {
 }
 
 
+class NoContentFromElasticException(Exception):
+    pass
+
+
 def get_date_from_time_horizon(time_horizon: str):
     """
     Parses number of dates from time horizon
@@ -265,18 +269,41 @@ def get_outage_matches(model_data: pandas.DataFrame, outages: pandas.DataFrame, 
     return matched_lines
 
 
-def update_outages(model_data: pandas.DataFrame, existing_outages: pandas.DataFrame, outages_to_set: pandas.DataFrame):
+def update_outages(model_data: pandas.DataFrame,
+                   existing_outages: pandas.DataFrame,
+                   outages_to_set: pandas.DataFrame,
+                   eic_to_mrid_map: pandas.DataFrame,
+                   outage_name_field: str = 'name',
+                   eic_codes_column: str = 'EIC'):
     """
     Links outages to devices in igm, gets difference of the outages from the old scenario date and new scenario date
     Switches on devices which outages will be expired in future and switches of devices that will go to outages
     :param model_data: necessary IGMs (in triplets)
     :param existing_outages: dataframe of outage data for the timestamp from which the model was taken
     :param outages_to_set: dataframe of outage data for a future timestamp that the model will represent
+    :param outage_name_field:
+    :param eic_to_mrid_map: map
+    :param eic_codes_column:
     :return updated model_data
     """
     model_data = get_opdm_data_from_models(model_data)
-    existing_lines = get_outage_matches(model_data=model_data, outages=existing_outages)
-    updated_lines = get_outage_matches(model_data=model_data, outages=outages_to_set)
+    if eic_to_mrid_map.empty:
+        existing_lines = get_outage_matches(model_data=model_data,
+                                            outages=existing_outages,
+                                            outage_name_field=outage_name_field)
+        updated_lines = get_outage_matches(model_data=model_data,
+                                           outages=outages_to_set,
+                                           outage_name_field=outage_name_field)
+    else:
+        column_headings = eic_to_mrid_map.columns.values.tolist()
+        if 'mRID' in column_headings and 'ID' not in column_headings:
+            eic_to_mrid_map = eic_to_mrid_map.rename(columns={'mRID': 'ID'})
+        existing_lines = existing_outages[[eic_codes_column]].merge(eic_to_mrid_map,
+                                                                    left_on=eic_codes_column,
+                                                                    right_on='EIC')
+        updated_lines = outages_to_set[[eic_codes_column]].merge(eic_to_mrid_map,
+                                                                 left_on=eic_codes_column,
+                                                                 right_on='EIC')
     # Tricky part: get changes
     changes = existing_lines.merge(updated_lines, on='ID', how='outer', suffixes=('_PRE', '_POST'), indicator=True)
     # Get those devices that will come to service
@@ -377,9 +404,11 @@ def change_change_scenario_date_time_horizon(existing_models: list,
 
             # Update outages
             if (existing_outages is not None) or (outages_to_set is not None):
+                eic_mrid_map = get_eic_to_mrid_mapping()
                 profile = update_outages(model_data=profile,
                                          existing_outages=existing_outages,
-                                         outages_to_set=outages_to_set)
+                                         outages_to_set=outages_to_set,
+                                         eic_to_mrid_map=eic_mrid_map)
             profile = triplets.cgmes_tools.update_FullModel_from_filename(profile)
             serialized_data = export_to_cgmes_zip([profile])
             if len(serialized_data) == 1:
@@ -496,7 +525,15 @@ def get_week_ahead_models(bucket_name, prefix, current_scenario_date):
             # Extract the scenario date part from the object name (e.g., 20240907T0830Z)
             # Suggestion to replace
             try:
-                date_to_str = model.object_name.split('-')[3]
+                # if date is 20240907T0830Z then corresponding regex would be:
+                # fixed \d{8}T\d{4}Z or varying \d+T\d+Z
+                scenario_datetime_pattern = r'(\d+T\d+Z)'
+                key_pattern = r''
+                # date_to_str = model.object_name.split('-')[3]
+                date_to_str_match = re.search(scenario_datetime_pattern, model.object_name)
+                if not date_to_str_match:
+                    continue
+                date_to_str = date_to_str_match.group(1)
                 scenario_date_to = datetime.datetime.strptime(date_to_str, "%Y%m%dT%H%MZ")
 
                 # Make scenario_date_to timezone-aware by adding UTC timezone
@@ -513,7 +550,10 @@ def get_week_ahead_models(bucket_name, prefix, current_scenario_date):
 
                     # Create a unique key based on scenario date and TSO name to track the latest version
                     # key = (scenario_date_to, model.object_name.split('-')[4])  # e.g., (20240907T0830Z, 'ELERING')
-                    key = (scenario_date_to, model.object_name.split('-')[5])
+                    # Change this
+                    entity = re.search(r'-(\w+)-\d{3}\.zip', model.object_name).group(1)
+                    # key = (scenario_date_to, model.object_name.split('-')[5])
+                    key = (scenario_date_to, entity)
                     # If the key doesn't exist or the current model has a higher version, update the latest model
                     if key not in latest_models or latest_models[key]['version'] < version_number:
                         latest_models[key] = {'version': version_number, 'object_name': model.object_name}
@@ -561,11 +601,17 @@ def package_wk_model_to_zip(updated_wk_model: dict):
 def get_tso_name_from_string(str_value):
     """
     Tries to return a tso name from string
+    :param str_value: name of the file to be parsed
+    :return tso name if exists
     """
     try:
         components = os.path.basename(str_value).split('-')
         if len(components) == 7:
             return components[5]
+        logger.warning(f"{str_value} is not a standard")
+        regex_match = re.search(r'-(\w+)-\d{3}.', os.path.basename(str_value)).group(1)
+        if regex_match:
+            return regex_match
         return None
     except Exception:
         return None
@@ -683,26 +729,22 @@ def get_opc_data(index_name: str = 'filtered_opc*',
 
 
 def flatten_list(x):
+    """
+    Flattens nested list to single level list recursively
+    :param x: input list
+    """
     if isinstance(x, Iterable) and not isinstance(x, (str, bytes)):
         return [a for i in x for a in flatten_list(i)]
     return [x]
-    # for element in element_list:
-    #     if isinstance(element, Iterable) and not isinstance(element, (str, bytes)):
-    #         yield from flatten_list(element)
-    #     else:
-    #         yield element
-    # if isinstance(element_list, collections.Iterable):
-    #     return [a for i in element_list for a in flatten_list(i)]
-    # else:
-    #     return [element_list]
-    # for item in element_list:
-    #     try:
-    #         yield from flatten_list(item)
-    #     except TypeError:
-    #         yield item
 
 
 def filter_opc_data_by_tso(row_data, field_name, tso_eic_codes: dict | list):
+    """
+    Filters dataframe rows by tso eic codes
+    :param row_data: row from pandas.DataFrame
+    :param field_name: field where tso eic code is
+    :param tso_eic_codes: list of tso eic code prefixes
+    """
     if isinstance(tso_eic_codes, dict):
         tso_eic_codes = [*tso_eic_codes.values()]
     if isinstance(tso_eic_codes, list):
@@ -711,6 +753,33 @@ def filter_opc_data_by_tso(row_data, field_name, tso_eic_codes: dict | list):
         tso_eic_codes = [tso_eic_codes]
     eic_code = row_data[field_name].str.upper()
     return eic_code[:2] in tso_eic_codes
+
+
+def get_eic_to_mrid_mapping(elastic_index: str = 'config-network-elements*',
+                            field_names: list = None):
+    """
+    Queries eic to mrid map from elastic
+    :param elastic_index: name of the index
+    :param field_names: names of the columns for eic and mrid
+    :return pandas.Dataframe
+    """
+    if not field_names:
+        field_names = ['EIC', 'mRID']
+    query_part = {"match_all": {}}
+    try:
+        elastic_client = Elastic()
+        results = elastic_client.get_docs_by_query(index=elastic_index,
+                                                   query=query_part,
+                                                   size=1000,
+                                                   return_df=True)
+        if results.empty:
+            raise NoContentFromElasticException
+        return results[field_names]
+    except (NoContentFromElasticException, KeyError, ValueError):
+        logger.info(f"no data found, or missing fields")
+    except Exception as ex:
+        logger.warning(f"Got elastic error: {ex}")
+    return pandas.DataFrame
 
 
 if __name__ == "__main__":
@@ -737,7 +806,7 @@ if __name__ == "__main__":
     test_mas = 'http://www.baltic-rsc.eu/OperationalPlanning/CGM'
 
     minio_service = minio.ObjectStorage()
-    current_scenario_date = "2024-09-25T08:30:00+00:00"
+    current_scenario_date = "2024-10-09T08:30:00+00:00"
     existing_time_horizons = ['1D', '2D']
     virtual_time_horizons = ['3D', '4D', '5D', '6D', '7D', '8D', '9D']
     included_models = [
@@ -748,6 +817,24 @@ if __name__ == "__main__":
         'ELERING',
         'AST'
     ]
+
+    # # opc-report index
+    opc_index_name = 'opc-report*'
+    opc_name_field = 'TimeSeries.RegisteredResource.name'
+    opc_start_date_field = 'TimeSeries.outage_Period.timeInterval.start'
+    opc_end_date_field = 'TimeSeries.outage_Period.timeInterval.end'
+    # # Change this, in opc-report index everybody is using different field for storing mRID (EIC code)
+    opc_eic_column_name = 'TimeSeries.RegisteredResource.mRID.#text'
+
+    # # opc-filtered index
+    # opc_index_name = 'filtered_opc*'
+    # opc_name_field = 'name'
+    # opc_start_date_field = 'start_date'
+    # opc_end_date_field = 'end_date'
+    # opc_eic_column_name = 'EIC'
+
+    elastic_index_for_mapping = 'config-network-elements*'
+    eic_mrid_map = get_eic_to_mrid_mapping(elastic_index_for_mapping)
 
     retrieved_WK_files = get_week_ahead_models(bucket_name='opde-confidential-models',
                                                prefix='IGM',
@@ -866,14 +953,28 @@ if __name__ == "__main__":
             updated_models = change_change_scenario_date_time_horizon_new(existing_models=filtered_models,
                                                                           time_horizon_to_set=new_time_horizon,
                                                                           scenario_time_to_set=new_scenario_date)
-            old_filtered_outages = get_opc_data(opc_start_datetime=old_scenario_date)
-            new_filtered_outages = get_opc_data(opc_start_datetime=new_scenario_date)
-            old_filtered_outages = old_filtered_outages.drop_duplicates(subset=['name'], keep='first')
-            new_filtered_outages = new_filtered_outages.drop_duplicates(subset=['name'], keep='first')
-            outage_changes = old_filtered_outages[['name']].merge(new_filtered_outages[['name']],
-                                                                  on='name',
-                                                                  how='outer',
-                                                                  indicator=True)
+            old_filtered_outages = get_opc_data(index_name=opc_index_name,
+                                                opc_start_datetime=old_scenario_date,
+                                                start_datetime_field_name=opc_start_date_field,
+                                                end_date_time_field_name=opc_end_date_field)
+            new_filtered_outages = get_opc_data(index_name=opc_index_name,
+                                                opc_start_datetime=new_scenario_date,
+                                                start_datetime_field_name=opc_start_date_field,
+                                                end_date_time_field_name=opc_end_date_field)
+            # fix eic codes:
+            if 'filtered_opc' in opc_index_name:
+                old_filtered_outages[opc_eic_column_name] = (old_filtered_outages['eic']
+                                                             .combine_first(old_filtered_outages['element_id_eic']))
+                new_filtered_outages[opc_eic_column_name] = (new_filtered_outages['eic']
+                                                             .combine_first(new_filtered_outages['element_id_eic']))
+            old_filtered_outages = old_filtered_outages.drop_duplicates(subset=[opc_name_field],
+                                                                        keep='first')
+            new_filtered_outages = new_filtered_outages.drop_duplicates(subset=[opc_name_field],
+                                                                        keep='first')
+            outage_changes = old_filtered_outages[[opc_name_field]].merge(new_filtered_outages[[opc_name_field]],
+                                                                          on=opc_name_field,
+                                                                          how='outer',
+                                                                          indicator=True)
             outage_changes = outage_changes[
                 (outage_changes['_merge'] == 'left_only') | (outage_changes['_merge'] == 'right_only')]
             if not outage_changes.empty:
@@ -881,7 +982,10 @@ if __name__ == "__main__":
                 print(outage_changes.to_string())
                 updated_models = update_outages(model_data=updated_models,
                                                 existing_outages=old_filtered_outages,
-                                                outages_to_set=new_filtered_outages)
+                                                outages_to_set=new_filtered_outages,
+                                                eic_to_mrid_map=eic_mrid_map,
+                                                eic_codes_column=opc_eic_column_name,
+                                                outage_name_field=opc_name_field)
             updated_serialized_data = export_to_cgmes_zip([updated_models])
             updated_model_data, _ = group_files_by_origin(list_of_files=updated_serialized_data)
             for updated_tso in updated_model_data:
