@@ -2,6 +2,7 @@ import logging
 import os.path
 from datetime import datetime
 from decimal import Decimal
+from enum import Enum
 from io import BytesIO
 from uuid import uuid4
 from zipfile import ZipFile
@@ -21,7 +22,7 @@ from emf.common.logging.pypowsybl_logger import PyPowsyblLogGatheringHandler, Py
 from emf.loadflow_tool import loadflow_settings
 from emf.loadflow_tool.helper import load_model, load_opdm_data, create_opdm_objects
 from emf.loadflow_tool.model_merger import merge_functions
-from emf.loadflow_tool.model_merger.handlers.cgm_handler import async_call, log_opdm_response
+from emf.loadflow_tool.model_merger.model_merger import async_call, log_opdm_response
 from emf.loadflow_tool.model_merger.merge_functions import run_lf, create_sv_and_updated_ssh, fix_sv_shunts, \
     fix_sv_tapsteps, export_to_cgmes_zip, filter_models, remove_small_islands
 from emf.loadflow_tool.model_validator.validator import validate_model
@@ -30,6 +31,8 @@ logger = logging.getLogger(__name__)
 parse_app_properties(caller_globals=globals(), path=config.paths.cgm_worker.merger)
 SMALL_ISLAND_SIZE = 5
 SV_INJECTION_LIMIT = 0.1
+MERGE_LOAD_FLOW_SETTINGS = loadflow_settings.CGM_RELAXED_2
+PY_REPORT_ELK_INDEX = MERGE_REPORT_ELK_INDEX
 
 
 def get_opdm_data_from_models(model_data: list | pandas.DataFrame):
@@ -199,6 +202,8 @@ def revert_failed_buses(cgm_sv_data,
     :param revert_failed_terminals: set it true to revert the flows for terminals
     :return updated merged SV and SSH profiles
     """
+    if failed_buses is None or failed_buses.empty:
+        return cgm_sv_data
     # Check that input is triplets
     original_models = get_opdm_data_from_models(model_data=original_models)
     # Get terminals merged with nok nodes (see condition 2)
@@ -297,6 +302,21 @@ def handle_not_retained_switches_between_nodes(original_data, open_not_retained_
     return original_data, updated_switches
 
 
+def get_str_from_enum(input_value):
+    """
+    Tries to parse the input to string
+    :param input_value:input string
+    """
+    if isinstance(input_value, str):
+        return input_value
+    if isinstance(input_value, Enum):
+        return input_value.name
+    try:
+        return input_value.name
+    except AttributeError:
+        return input_value
+
+
 def get_failed_buses(load_flow_results: list, network_instance: pypowsybl.network, fail_types=None):
     """
     Gets dataframe of failed buses for postprocessing
@@ -305,21 +325,28 @@ def get_failed_buses(load_flow_results: list, network_instance: pypowsybl.networ
     :param fail_types: list of fail types
     :return dataframe of failed buses
     """
-    if not fail_types:
-        fail_types = [pypowsybl.loadflow.ComponentStatus.FAILED,
-                      pypowsybl.loadflow.ComponentStatus.NO_CALCULATION,
-                      pypowsybl.loadflow.ComponentStatus.CONVERGED,
-                      pypowsybl.loadflow.ComponentStatus.MAX_ITERATION_REACHED,
+    if isinstance(fail_types, list) and len(fail_types) >= 1:
+        fail_types = [get_str_from_enum(fail_type) for fail_type in fail_types]
+    else:
+        fail_types = [get_str_from_enum(pypowsybl.loadflow.ComponentStatus.FAILED),
+                      get_str_from_enum(pypowsybl.loadflow.ComponentStatus.NO_CALCULATION),
+                      # get_str_from_enum(pypowsybl.loadflow.ComponentStatus.CONVERGED),
+                      # get_str_from_enum(pypowsybl.loadflow.ComponentStatus.MAX_ITERATION_REACHED),
                       # pypowsybl.loadflow.ComponentStatus.SOLVER_FAILED
                       ]
+
     max_iteration = len([result for result in load_flow_results
-                         if result['status'] == pypowsybl.loadflow.ComponentStatus.MAX_ITERATION_REACHED])
+                         if get_str_from_enum(result['status'])
+                         == get_str_from_enum(pypowsybl.loadflow.ComponentStatus.MAX_ITERATION_REACHED)])
     successful = len([result for result in load_flow_results
-                      if result['status'] == pypowsybl.loadflow.ComponentStatus.CONVERGED])
+                      if get_str_from_enum(result['status'])
+                      == get_str_from_enum(pypowsybl.loadflow.ComponentStatus.CONVERGED)])
     not_calculated = len([result for result in load_flow_results
-                          if result['status'] == pypowsybl.loadflow.ComponentStatus.NO_CALCULATION])
+                          if get_str_from_enum(result['status'])
+                          == get_str_from_enum(pypowsybl.loadflow.ComponentStatus.NO_CALCULATION)])
     failed = len([result for result in load_flow_results
-                  if result['status'] == pypowsybl.loadflow.ComponentStatus.FAILED])
+                  if get_str_from_enum(result['status'])
+                  == get_str_from_enum(pypowsybl.loadflow.ComponentStatus.FAILED)])
     sum_of_messages = len(load_flow_results) - successful - failed - not_calculated - max_iteration
     messages = [f"Networks: {len(load_flow_results)}"]
     if successful:
@@ -337,7 +364,8 @@ def get_failed_buses(load_flow_results: list, network_instance: pypowsybl.networ
         logger.error(message)
     else:
         logger.info(message)
-    troublesome_buses = pandas.DataFrame([result for result in load_flow_results if result['status'] in fail_types])
+    troublesome_buses = pandas.DataFrame([result for result in load_flow_results
+                                          if get_str_from_enum(result['status']) in fail_types])
     # troublesome_buses = pandas.concat([failed, not_calculated])
     if not troublesome_buses.empty:
         troublesome_buses = (network_instance.get_buses().reset_index()
@@ -678,7 +706,7 @@ def merge_models(list_of_models: list,
     rmm_object.name = f"{rmm_name}.zip"
     # logger.info(f"Uploading RMM to MINO {OUTPUT_MINIO_BUCKET}/{rmm_object.name}")
 
-    return rmm_object
+    return rmm_object, solved_model
 
 
 if __name__ == '__main__':
@@ -789,17 +817,17 @@ if __name__ == '__main__':
             logger.error("No models to merge :(")
             sys.exit()
         check_and_create_the_folder_path(where_to_store_stuff)
-        test_model = merge_models(list_of_models=available_models,
-                                  latest_boundary=loaded_boundary,
-                                  time_horizon=test_time_horizon,
-                                  scenario_datetime=test_scenario_datetime,
-                                  merging_area=test_merging_area,
-                                  merging_entity=test_merging_entity,
-                                  mas=test_mas,
-                                  version=test_version,
-                                  # Comment this line in if all nodes in csv are needed
-                                  # path_local_storage=where_to_store_stuff,
-                                  push_to_opdm=send_to_opdm)
+        test_model, model_itself = merge_models(list_of_models=available_models,
+                                                latest_boundary=loaded_boundary,
+                                                time_horizon=test_time_horizon,
+                                                scenario_datetime=test_scenario_datetime,
+                                                merging_area=test_merging_area,
+                                                merging_entity=test_merging_entity,
+                                                mas=test_mas,
+                                                version=test_version,
+                                                # Comment this line in if all nodes in csv are needed
+                                                # path_local_storage=where_to_store_stuff,
+                                                push_to_opdm=send_to_opdm)
 
 
         full_name = where_to_store_stuff.removesuffix('/') + '/' + test_model.name.removeprefix('/')
