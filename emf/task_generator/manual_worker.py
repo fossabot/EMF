@@ -38,13 +38,18 @@ elif TIME_HORIZON == 'ID':
     timeframe_config_json[0]['@id'] = "https://example.com/timeHorizons/D-1"
 
 process_config_json[0]['runs'][0]['properties']['merge_type'] = MERGE_TYPE
-process_config_json[0]['runs'][0]['properties']['included'] = INCLUDED_TSO.split(',') if INCLUDED_TSO else []
-process_config_json[0]['runs'][0]['properties']['excluded'] = EXCLUDED_TSO.split(',') if EXCLUDED_TSO else []
-process_config_json[0]['runs'][0]['properties']['local_import'] = LOCAL_IMPORT.split(',') if LOCAL_IMPORT else []
+process_config_json[0]['runs'][0]['properties']['included'] = [tso.strip() for tso in INCLUDED_TSO.split(',')] if INCLUDED_TSO else []
+process_config_json[0]['runs'][0]['properties']['excluded'] = [tso.strip() for tso in EXCLUDED_TSO.split(',')] if EXCLUDED_TSO else []
+process_config_json[0]['runs'][0]['properties']['local_import'] = [tso.strip() for tso in LOCAL_IMPORT.split(',')] if LOCAL_IMPORT else []
 process_config_json[0]['runs'][0]['properties']['time_horizon'] = TIME_HORIZON
 process_config_json[0]['runs'][0]['properties']['version'] = TASK_VERSION
-process_config_json[0]['runs'][0]['properties']['replacement'] = RUN_REPLACEMENT
 # process_config_json[0]['runs'][0]['properties']['mas'] = TASK_MAS
+process_config_json[0]['runs'][0]['properties']['replacement'] = RUN_REPLACEMENT
+process_config_json[0]['runs'][0]['properties']['scaling'] = RUN_SCALING
+process_config_json[0]['runs'][0]['properties']['upload_to_opdm'] = UPLOAD_TO_OPDM
+process_config_json[0]['runs'][0]['properties']['upload_to_minio'] = UPLOAD_TO_MINIO
+process_config_json[0]['runs'][0]['properties']['send_merge_report'] = SEND_MERGE_REPORT
+
 process_config_json[0]['runs'][0]['properties']['merging_entity'] = TASK_MERGING_ENTITY
 timeframe_config_json[0]['period_start'] = f'{PROCESS_TIME_SHIFT}'
 timeframe_config_json[0]['period_duration'] = TASK_PERIOD_DURATION

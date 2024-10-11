@@ -24,16 +24,28 @@ SV_INJECTION_LIMIT = 0.1
 
 def run_lf(merged_model, loadflow_settings=loadflow_settings.CGM_DEFAULT):
 
-    loadflow_report = pypowsybl.report.Reporter()
-
-    loadflow_result = pypowsybl.loadflow.run_ac(network=merged_model["network"],
+    # report = pypowsybl.report.Reporter()
+    result = pypowsybl.loadflow.run_ac(network=merged_model["network"],
                                                 parameters=loadflow_settings,
-                                                reporter=loadflow_report)
+                                                # reporter=loadflow_report,
+                                                )
 
-    loadflow_result_dict = [attr_to_dict(island) for island in loadflow_result]
+    result_dict = [attr_to_dict(island) for island in result]
+    # Modify all nested objects to native data types
+    for island in result_dict:
+        island['status'] = island['status'].name
+        # Extract only first slack bus from internal pypowsybl object
+        slack_bus_results = island.pop('slack_bus_results')
+        if slack_bus_results:
+            island['slack_bus_id'] = getattr(slack_bus_results[0], 'id', 'undefined')
+            island['active_power_mismatch'] = getattr(slack_bus_results[0], 'active_power_mismatch', float())
+        else:
+            island['slack_bus_id'] = 'undefined'
+            island['active_power_mismatch'] = float()
+
     # merged_model["LOADFLOW_REPORT"] = json.loads(loadflow_report.to_json())
-    merged_model["LOADFLOW_REPORT"] = str(loadflow_report)
-    merged_model["LOADFLOW_RESULTS"] = loadflow_result_dict
+    # merged_model["LOADFLOW_REPORT"] = str(loadflow_report)
+    merged_model["LOADFLOW_RESULTS"] = result_dict
 
     return merged_model
 
@@ -431,7 +443,6 @@ def generate_merge_report(merged_model, input_models, merge_data):
     Returns:
         dict: report of merge results
     """
-    model_elements = get_network_elements(merged_model['network'], pypowsybl.network.ElementType.BUS)
     task_properties = merge_data.get('task')['task_properties']
     merge_report = {'loadflow': {'island': []}, 'merge': {}}
 
@@ -442,44 +453,67 @@ def generate_merge_report(merged_model, input_models, merge_data):
                          '@task_id': merge_data['task'].get('@id'),
                          '@time_horizon': task_properties.get('time_horizon'),
                          '@scenario_timestamp': task_properties.get('timestamp_utc'),
-                         '@version': task_properties.get('version'),
-                         'merge_type': task_properties.get('merge_type'),
-                         'merge_entity': task_properties.get('merging_entity'),
+                         '@version': int(task_properties.get('version')),
                          })
 
     pp_results = [island for island in merged_model['LOADFLOW_RESULTS'] if island['reference_bus_id']]
-    pp_report = parse_pypowsybl_report(merged_model['LOADFLOW_REPORT'])
+    # pp_report = parse_pypowsybl_report(merged_model['LOADFLOW_REPORT'])  # TODO backup if string report will be needed
 
+    # Get buses count in each component
+    buses = get_network_elements(merged_model['network'], pypowsybl.network.ElementType.BUS)
+    buses_by_component = buses.connected_component.value_counts()
+
+    # Store islands loadflow results
     for island in pp_results:
-        island['status'] = island.get('status').name
-        island['active_power_mismatch'] = island.pop('slack_bus_results')[0].active_power_mismatch
+        if buses_by_component.loc[island['connected_component_num']] > int(merge_data.get('small_island_size')):
+            merge_report['loadflow']['island'].append(island)
 
-    for dict1, dict2 in zip(pp_report, pp_results):
-        combined = {**dict1, **dict2}
-        if int(dict1['buses']) > int(merge_data.get('small_island_size')):
-            merge_report['loadflow']['island'].append(combined)
+    # for dict1, dict2 in zip(pp_report, pp_results):
+    #     combined = {**dict1, **dict2}
+    #     if int(dict1['buses']) > int(merge_data.get('small_island_size')):
+    #         merge_report['loadflow']['island'].append(combined)
 
+    # Store network balance results
+    generators = merged_model['network'].get_generators().merge(buses, left_on='bus_id', right_index=True)
+    loads = merged_model['network'].get_loads().merge(buses, left_on='bus_id', right_index=True)
+    branches = merged_model['network'].get_branches().merge(buses, left_on='bus1_id', right_index=True)
+    generation_by_component = generators.groupby('connected_component')[['p', 'q']].sum()
+    load_by_component = loads.groupby('connected_component')[['p', 'q']].sum()
+    branches_by_component = branches.connected_component.value_counts()
     for island in merge_report['loadflow']['island']:
-        island['Scenario_date'] = task_properties.get('timestamp_utc')
-        island['Slack_bus_name'] = model_elements.loc[island['Slack bus']]['name']
-        island['Slack_bus_region'] = model_elements.loc[island['Slack bus']]['country']
-        network_balance = {"active_generation_MW": float(island['Network balance']['active generation'].split()[0]),
-                           "active_load_MW": float(island['Network balance']['active load'].split()[0]),
-                           "reactive_generation_MVar": float(island['Network balance']['reactive generation'].split()[0]),
-                           "reactive_load_MVar": float(island['Network balance']['reactive load'].split()[0])}
-        island.update({k: v for k, v in network_balance.items()})
-        island.pop('Network balance')
-    merge_report['loadflow'].update({"island_count": len(merge_report['loadflow']['island']), "loadflow_parameters": merge_data.get('loadflow_settings')})
+        try:
+            island['slack_bus_name'] = buses.loc[island['slack_bus_id']]['name']
+            island['slack_bus_region'] = buses.loc[island['slack_bus_id']]['country']
+        except Exception as e:
+            logger.warning(f"Unable to find name or country of slack bus id: {island['slack_bus_id']} [err: {e}]")
+            island['slack_bus_name'] = ''
+            island['slack_bus_region'] = ''
 
+        network_balance = {"generation_p": float(generation_by_component.loc[island['connected_component_num']].p),
+                           "load_p": float(load_by_component.loc[island['connected_component_num']].p),
+                           "generation_q": float(generation_by_component.loc[island['connected_component_num']].q),
+                           "load_q": float(load_by_component.loc[island['connected_component_num']].q),
+                           "buses": int(buses_by_component.loc[island['connected_component_num']]),
+                           "branches": int(branches_by_component.loc[island['connected_component_num']]),
+                           }
+
+        island.update({k: v for k, v in network_balance.items()})
+        # island.pop('Network balance')
+
+    merge_report['loadflow'].update({"island_count": len(merge_report['loadflow']['island']),
+                                     "parameters": merge_data.get('loadflow_settings'),
+                                     })
     merge_report['network'] = merged_model['network_meta']
     merge_report['network'].update({'name': merge_data.get('cgm_name')})
 
     merge_report['merge'].update({
+        "type": task_properties.get('merge_type'),
+        "entity": task_properties.get('merging_entity'),
         "status": [pp_results[0]['status']],
         "included": [model['pmd:TSO'] for model in input_models if model['pmd:TSO']],
         "excluded": [item for item in task_properties['included'] + task_properties['local_import'] if item not in [model['pmd:TSO'] for model in input_models]],
         "exclusion_reason": merge_data.get('exclusion_reason'),
-        "merge_duration_s": merge_data.get('merge_duration'),
+        "duration_s": float(merge_data.get('merge_duration')),
         "scaled": merge_data.get('scaled'),
         "replaced": merge_data.get('replacement'),
         "replaced_entity": merge_data.get('replaced_entity'),
@@ -723,6 +757,58 @@ def disconnect_equipment_if_flow_sum_not_zero(cgm_sv_data,
     return cgm_sv_data, cgm_ssh_data
 
 
+def set_brell_lines_to_zero_in_models(opdm_models, magic_brell_lines: dict = None, profile_to_change: str = "SSH"):
+    """
+    Sets p and q of given  (BRELL) lines to zero
+    Copied from emf_python as is
+    Workflow:
+    1) Take models (in cgmes format)
+    2) parse profile ("SSH") to triplets
+    3) Check and set the BRELL lines
+    4) if lines were set, repackage from triplets to CGMES and replace it in given profile
+    5) return models (losses: ""->'' in header, tab -> double space, closing tags -> self-closing tags if empty)
+    Note that in test run only one of them: L309 was present in AST
+    :param opdm_models: list of opdm models
+    :param magic_brell_lines: dictionary of brell lines
+    :param profile_to_change: profile to change
+    """
+    if not magic_brell_lines:
+        magic_brell_lines = {'L373': 'cf3af93a-ad15-4db9-adc2-4e4454bb843f',
+                             'L374': 'd98ec0d4-4e25-4667-b21f-5b816a6e8871',
+                             'L358': 'e0786c57-57ff-454e-b9e2-7a912d81c674',
+                             'L309': '7bd0deae-f000-4b15-a24d-5cf30765219f'}
+    for model in opdm_models[:]:
+        logger.info(f"Checking brell lines in {model.get('pmd:content-reference'), ''}")
+        try:
+            profile = load_opdm_data(opdm_objects=[model], profile=profile_to_change)
+        except Exception as error:
+            logger.error(f"Failed to load model: {error}")
+            opdm_models.remove(model)
+            continue
+        repackage_needed = False
+        for line, line_id in magic_brell_lines.items():
+            if profile.query(f"ID == '{line_id}'").empty:
+                logger.info(f"Skipping brell line {line} as it was not found in data")
+            else:
+                repackage_needed = True
+                logger.info(f"Setting brell line {line} EquivalentInjection.p and EquivalentInjection.q to 0")
+                profile.loc[
+                    profile.query(f"ID == '{line_id}' and KEY == 'EquivalentInjection.p'").index, "VALUE"] = 0
+                profile.loc[
+                    profile.query(f"ID == '{line_id}' and KEY == 'EquivalentInjection.q'").index, "VALUE"] = 0
+        if repackage_needed:
+            profile = triplets.cgmes_tools.update_FullModel_from_filename(profile)
+            serialized_data = export_to_cgmes_zip([profile])
+            if len(serialized_data) == 1:
+                serialized = serialized_data[0]
+                serialized.seek(0)
+                for model_profile in model.get('opde:Component', []):
+                    if model_profile.get('opdm:Profile', {}).get('pmd:cgmesProfile') == profile_to_change:
+                        model_profile['opdm:Profile']['DATA'] = serialized.read()
+
+    return opdm_models
+
+
 if __name__ == "__main__":
 
     from emf.common.integrations.object_storage.models import get_latest_boundary, get_latest_models_and_download
@@ -772,7 +858,3 @@ if __name__ == "__main__":
             {"name": instance_file.name,
              "response": publication_response}
         )
-
-    # Emport to EDX
-
-    # Export to MINIO + ELK
