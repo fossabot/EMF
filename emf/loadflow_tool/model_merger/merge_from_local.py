@@ -2,6 +2,7 @@ import logging
 import os.path
 from datetime import datetime
 from decimal import Decimal
+from enum import Enum
 from io import BytesIO
 from uuid import uuid4
 from zipfile import ZipFile
@@ -21,7 +22,7 @@ from emf.common.logging.pypowsybl_logger import PyPowsyblLogGatheringHandler, Py
 from emf.loadflow_tool import loadflow_settings
 from emf.loadflow_tool.helper import load_model, load_opdm_data, create_opdm_objects
 from emf.loadflow_tool.model_merger import merge_functions
-from emf.loadflow_tool.model_merger.handlers.cgm_handler import async_call, log_opdm_response
+from emf.loadflow_tool.model_merger.model_merger import async_call, log_opdm_response
 from emf.loadflow_tool.model_merger.merge_functions import run_lf, create_sv_and_updated_ssh, fix_sv_shunts, \
     fix_sv_tapsteps, export_to_cgmes_zip, filter_models, remove_small_islands
 from emf.loadflow_tool.model_validator.validator import validate_model
@@ -30,6 +31,8 @@ logger = logging.getLogger(__name__)
 parse_app_properties(caller_globals=globals(), path=config.paths.cgm_worker.merger)
 SMALL_ISLAND_SIZE = 5
 SV_INJECTION_LIMIT = 0.1
+MERGE_LOAD_FLOW_SETTINGS = loadflow_settings.CGM_RELAXED_2
+PY_REPORT_ELK_INDEX = MERGE_REPORT_ELK_INDEX
 
 
 def get_opdm_data_from_models(model_data: list | pandas.DataFrame):
@@ -199,6 +202,8 @@ def revert_failed_buses(cgm_sv_data,
     :param revert_failed_terminals: set it true to revert the flows for terminals
     :return updated merged SV and SSH profiles
     """
+    if failed_buses is None or failed_buses.empty:
+        return cgm_sv_data
     # Check that input is triplets
     original_models = get_opdm_data_from_models(model_data=original_models)
     # Get terminals merged with nok nodes (see condition 2)
@@ -297,6 +302,21 @@ def handle_not_retained_switches_between_nodes(original_data, open_not_retained_
     return original_data, updated_switches
 
 
+def get_str_from_enum(input_value):
+    """
+    Tries to parse the input to string
+    :param input_value:input string
+    """
+    if isinstance(input_value, str):
+        return input_value
+    if isinstance(input_value, Enum):
+        return input_value.name
+    try:
+        return input_value.name
+    except AttributeError:
+        return input_value
+
+
 def get_failed_buses(load_flow_results: list, network_instance: pypowsybl.network, fail_types=None):
     """
     Gets dataframe of failed buses for postprocessing
@@ -305,21 +325,28 @@ def get_failed_buses(load_flow_results: list, network_instance: pypowsybl.networ
     :param fail_types: list of fail types
     :return dataframe of failed buses
     """
-    if not fail_types:
-        fail_types = [pypowsybl.loadflow.ComponentStatus.FAILED,
-                      pypowsybl.loadflow.ComponentStatus.NO_CALCULATION,
-                      pypowsybl.loadflow.ComponentStatus.CONVERGED,
-                      pypowsybl.loadflow.ComponentStatus.MAX_ITERATION_REACHED,
+    if isinstance(fail_types, list) and len(fail_types) >= 1:
+        fail_types = [get_str_from_enum(fail_type) for fail_type in fail_types]
+    else:
+        fail_types = [get_str_from_enum(pypowsybl.loadflow.ComponentStatus.FAILED),
+                      get_str_from_enum(pypowsybl.loadflow.ComponentStatus.NO_CALCULATION),
+                      # get_str_from_enum(pypowsybl.loadflow.ComponentStatus.CONVERGED),
+                      # get_str_from_enum(pypowsybl.loadflow.ComponentStatus.MAX_ITERATION_REACHED),
                       # pypowsybl.loadflow.ComponentStatus.SOLVER_FAILED
                       ]
+
     max_iteration = len([result for result in load_flow_results
-                         if result['status'] == pypowsybl.loadflow.ComponentStatus.MAX_ITERATION_REACHED])
+                         if get_str_from_enum(result['status'])
+                         == get_str_from_enum(pypowsybl.loadflow.ComponentStatus.MAX_ITERATION_REACHED)])
     successful = len([result for result in load_flow_results
-                      if result['status'] == pypowsybl.loadflow.ComponentStatus.CONVERGED])
+                      if get_str_from_enum(result['status'])
+                      == get_str_from_enum(pypowsybl.loadflow.ComponentStatus.CONVERGED)])
     not_calculated = len([result for result in load_flow_results
-                          if result['status'] == pypowsybl.loadflow.ComponentStatus.NO_CALCULATION])
+                          if get_str_from_enum(result['status'])
+                          == get_str_from_enum(pypowsybl.loadflow.ComponentStatus.NO_CALCULATION)])
     failed = len([result for result in load_flow_results
-                  if result['status'] == pypowsybl.loadflow.ComponentStatus.FAILED])
+                  if get_str_from_enum(result['status'])
+                  == get_str_from_enum(pypowsybl.loadflow.ComponentStatus.FAILED)])
     sum_of_messages = len(load_flow_results) - successful - failed - not_calculated - max_iteration
     messages = [f"Networks: {len(load_flow_results)}"]
     if successful:
@@ -337,7 +364,8 @@ def get_failed_buses(load_flow_results: list, network_instance: pypowsybl.networ
         logger.error(message)
     else:
         logger.info(message)
-    troublesome_buses = pandas.DataFrame([result for result in load_flow_results if result['status'] in fail_types])
+    troublesome_buses = pandas.DataFrame([result for result in load_flow_results
+                                          if get_str_from_enum(result['status']) in fail_types])
     # troublesome_buses = pandas.concat([failed, not_calculated])
     if not troublesome_buses.empty:
         troublesome_buses = (network_instance.get_buses().reset_index()
@@ -347,6 +375,194 @@ def get_failed_buses(load_flow_results: list, network_instance: pypowsybl.networ
     return troublesome_buses
 
 
+def check_net_interchanges(cgm_sv_data, cgm_ssh_data, original_models, fix_errors: bool = False):
+    """
+    An attempt to calculate the net interchange 2 values and check them against those provided in ssh profiles
+    :param cgm_sv_data: merged sv profile
+    :param cgm_ssh_data: merged ssh profile
+    :param original_models: original profiles
+    :param fix_errors: injects new calculated flows into merged ssh profiles
+    :return (updated) ssh profiles
+    """
+    original_models = get_opdm_data_from_models(model_data=original_models)
+    control_areas = (original_models.type_tableview('ControlArea')
+                     .rename_axis('ControlArea')
+                     .reset_index())[['ControlArea', 'ControlArea.netInterchange', 'ControlArea.pTolerance',
+                                      'IdentifiedObject.energyIdentCodeEic', 'IdentifiedObject.name']]
+    tie_flows = (original_models.type_tableview('TieFlow')
+                 .rename_axis('TieFlow').rename(columns={'TieFlow.ControlArea': 'ControlArea',
+                                                         'TieFlow.Terminal': 'Terminal'})
+                 .reset_index())[['ControlArea', 'Terminal', 'TieFlow.positiveFlowIn']]
+    tie_flows = tie_flows.merge(control_areas[['ControlArea']], on='ControlArea')
+    terminals = (original_models.type_tableview('Terminal')
+                 .rename_axis('Terminal').reset_index())[['Terminal', 'ACDCTerminal.connected']]
+    tie_flows = tie_flows.merge(terminals, on='Terminal')
+    power_flows_pre = (original_models.type_tableview('SvPowerFlow')
+                       .rename(columns={'SvPowerFlow.Terminal': 'Terminal'})
+                       .reset_index())[['Terminal', 'SvPowerFlow.p']]
+    power_flows_post = (cgm_sv_data.type_tableview('SvPowerFlow')
+                        .rename(columns={'SvPowerFlow.Terminal': 'Terminal'})
+                        .reset_index())[['Terminal', 'SvPowerFlow.p']]
+    tie_flows = tie_flows.merge(power_flows_pre, on='Terminal', how='left')
+    tie_flows = tie_flows.merge(power_flows_post, on='Terminal', how='left',
+                                suffixes=('_pre', '_post'))
+    tie_flows_grouped = ((tie_flows.groupby('ControlArea')[['SvPowerFlow.p_pre', 'SvPowerFlow.p_post']].sum())
+                         .rename_axis('ControlArea').reset_index())
+    tie_flows_grouped = control_areas.merge(tie_flows_grouped, on='ControlArea')
+    tie_flows_grouped['Exceeded'] = (abs(tie_flows_grouped['ControlArea.netInterchange']
+                                         - tie_flows_grouped['SvPowerFlow.p_post']) >
+                                     tie_flows_grouped['ControlArea.pTolerance'])
+    net_interchange_errors = tie_flows_grouped[tie_flows_grouped.eval('Exceeded')]
+    if not net_interchange_errors.empty:
+        logger.error(f"Found {len(net_interchange_errors.index)} possible net interchange_2 problems:")
+        print(net_interchange_errors.to_string())
+        if fix_errors:
+            logger.warning(f"Updating {len(net_interchange_errors.index)} interchanges to new values")
+            new_areas = cgm_ssh_data.type_tableview('ControlArea').reset_index()[['ID',
+                                                                                  'ControlArea.pTolerance', 'Type']]
+            new_areas = new_areas.merge(net_interchange_errors[['ControlArea', 'SvPowerFlow.p_post']]
+                                        .rename(columns={'ControlArea': 'ID',
+                                                         'SvPowerFlow.p_post': 'ControlArea.netInterchange'}), on='ID')
+            cgm_ssh_data = triplets.rdf_parser.update_triplet_from_tableview(cgm_ssh_data, new_areas)
+    return cgm_ssh_data
+
+
+def get_pf_mismatch(cgm_sv_data, merged_models, path_local_storage: str = None):
+    """
+    This is for debugging Kirchhoff's 1st law. Proceed with caution, have no idea what or if something here does
+    something
+    :param cgm_sv_data: merged sv profile
+    :param merged_models: input igms
+    :param path_local_storage: where to store csv
+    """
+    # Get power flow after lf
+    power_flow = cgm_sv_data.type_tableview('SvPowerFlow')
+    # Get power flow before lf
+    original_power_flow = merged_models.type_tableview('SvPowerFlow')
+    # merge power flows
+    power_flow_diff = (original_power_flow[['SvPowerFlow.Terminal', 'SvPowerFlow.p', 'SvPowerFlow.q']]
+                       .rename(columns={'SvPowerFlow.p': 'pre.p', 'SvPowerFlow.q': 'pre.q'})
+                       .merge(power_flow[['SvPowerFlow.Terminal', 'SvPowerFlow.p', 'SvPowerFlow.q']]
+                              .rename(columns={'SvPowerFlow.p': 'post.p', 'SvPowerFlow.q': 'post.q'}),
+                              on='SvPowerFlow.Terminal',
+                              how='outer'))
+    # Get terminals
+    terminals = (merged_models.type_tableview('Terminal')
+                 .rename_axis('Terminal').reset_index()
+                 .rename(columns={'IdentifiedObject.name': 'Terminal.name'}))
+    try:
+        terminals = terminals[['Terminal',
+                               'ACDCTerminal.connected',
+                               'ACDCTerminal.sequenceNumber',
+                               'Terminal.name',
+                               'Terminal.ConductingEquipment',
+                               'Terminal.ConnectivityNode',
+                               'Terminal.TopologicalNode']]
+    except Exception:
+        terminals = terminals[['Terminal',
+                               'ACDCTerminal.connected',
+                               'ACDCTerminal.sequenceNumber',
+                               'Terminal.name',
+                               'Terminal.ConductingEquipment',
+                               'Terminal.TopologicalNode']]
+    # Get origins
+    tsos = (merged_models.query('KEY == "Model.modelingAuthoritySet"')[['VALUE', 'INSTANCE_ID']]
+            .rename(columns={'VALUE': 'modelingAuthoritySet'}))
+    topological_node_names = ((merged_models.type_tableview('TopologicalNode')
+                               .rename_axis('Terminal.TopologicalNode')
+                               .reset_index())
+                              .rename(columns={'IdentifiedObject.name': 'TopologicalNode.name',
+                                               'IdentifiedObject.description':
+                                                   'TopologicalNode.description'}))
+    try:
+        topological_node_names = topological_node_names[['Terminal.TopologicalNode',
+                                                         'TopologicalNode.name',
+                                                         'TopologicalNode.description',
+                                                         'TopologicalNode.ConnectivityNodeContainer']]
+    except KeyError:
+        logger.error(f"TopologicalNodes are not tied to connectivityContainers")
+        topological_node_names = topological_node_names[['Terminal.TopologicalNode',
+                                                         'TopologicalNode.name',
+                                                         'TopologicalNode.description', 'ConnectivityNodeContainer']]
+    all_topological_nodes = (merged_models.query('KEY=="Type" and VALUE=="TopologicalNode"')[['ID', 'INSTANCE_ID']]
+                             .rename(columns={'ID': 'Terminal.TopologicalNode'}))
+    all_topological_nodes = all_topological_nodes.merge(topological_node_names, on='Terminal.TopologicalNode',
+                                                        how='left')
+    all_topological_nodes = (all_topological_nodes
+                             .merge(tsos, on='INSTANCE_ID'))[['Terminal.TopologicalNode',
+                                                              'TopologicalNode.name',
+                                                              'TopologicalNode.description',
+                                                              'modelingAuthoritySet']]
+    # Calculate summed flows per topological node
+    flows_summed = ((power_flow_diff.merge(terminals,
+                                           left_on='SvPowerFlow.Terminal',
+                                           right_on='Terminal',
+                                           how='left').groupby('Terminal.TopologicalNode')[['pre.p', 'pre.q',
+                                                                                            'post.p', 'post.q']]
+                     .sum()).rename_axis('Terminal.TopologicalNode').reset_index()
+                    .rename(columns={'pre.p': 'pre.p.sum', 'pre.q': 'pre.q.sum',
+                                     'post.p': 'post.p.sum', 'post.q': 'post.q.sum'}))
+    flows_summed['Flow.exceeded'] = ((abs(flows_summed['post.p.sum']) > SV_INJECTION_LIMIT) |
+                                     (abs(flows_summed['post.q.sum']) > SV_INJECTION_LIMIT))
+    # Check if no Kirchhoff law violations exist in original data
+    pre_nok_nodes = flows_summed[(abs(flows_summed['pre.p.sum']) > SV_INJECTION_LIMIT) |
+                                 (abs(flows_summed['pre.q.sum']) > SV_INJECTION_LIMIT)]
+    if not pre_nok_nodes.empty:
+        print(f"{len(pre_nok_nodes.index)} topological nodes have Kirchhoff first law error")
+    # Divide into ok and nok nodes
+    nok_nodes_full = flows_summed[(abs(flows_summed['post.p.sum']) > SV_INJECTION_LIMIT) |
+                                  (abs(flows_summed['post.q.sum']) > SV_INJECTION_LIMIT)]
+    nok_nodes = nok_nodes_full[['Terminal.TopologicalNode']]
+    ok_nodes = flows_summed.merge(nok_nodes.drop_duplicates(), on='Terminal.TopologicalNode',
+                                  how='left', indicator=True)
+    ok_nodes = ok_nodes[ok_nodes['_merge'] == 'left_only'][['Terminal.TopologicalNode']]
+    # Merge terminals with power flows
+    terminals_flows = terminals.merge(power_flow_diff.rename(columns={'SvPowerFlow.Terminal': 'Terminal'}),
+                                      on='Terminal', how='left')
+    # Merge terminals with summed flows at nodes
+    terminals_nodes = terminals_flows.merge(flows_summed, on='Terminal.TopologicalNode', how='left')
+    # Get equipment names
+    all_names = ((merged_models.query('KEY == "IdentifiedObject.name"')[['ID', 'VALUE']])
+                 .rename(columns={'ID': 'Terminal.ConductingEquipment', 'VALUE': 'ConductingEquipment.name'}))
+    equipment_names = (merged_models.query('KEY == "Type"')[['ID', 'VALUE']]
+                       .drop_duplicates().rename(columns={'ID': 'Terminal.ConductingEquipment',
+                                                          'VALUE': 'ConductingEquipment.Type'}))
+    switches_retain = merged_models.query('KEY == "Switch.retained"')
+    switches_open = merged_models.query('KEY == "Switch.open"')
+    switches_state = (switches_retain[['ID', 'VALUE']]
+                      .rename(columns={'VALUE': 'retained'})
+                      .merge(switches_open[['ID', 'VALUE']]
+                             .rename(columns={'VALUE': 'opened'}), on='ID'))
+    equipment_names = equipment_names.merge(switches_state.rename(columns={'ID': 'Terminal.ConductingEquipment'}),
+                                            on='Terminal.ConductingEquipment', how='left')
+    equipment_names = equipment_names.merge(all_names, on='Terminal.ConductingEquipment', how='left')
+    # Merge terminals with equipment names
+    terminals_equipment = terminals_nodes.merge(equipment_names, on='Terminal.ConductingEquipment', how='left')
+    # Merge terminals with origins
+    terminals_equipment = terminals_equipment.merge(all_topological_nodes, on='Terminal.TopologicalNode', how='left')
+    terminals_equipment = terminals_equipment.sort_values(by=['Terminal.TopologicalNode'])
+    # Get error nodes from report
+    ok_lines = (terminals_equipment.merge(ok_nodes, on='Terminal.TopologicalNode')
+                .sort_values(by=['Terminal.TopologicalNode']))
+    nok_lines = (terminals_equipment.merge(nok_nodes, on='Terminal.TopologicalNode')
+                 .sort_values(by=['Terminal.TopologicalNode']))
+    if not nok_nodes.empty:
+        logger.warning(f"Sum of flows {len(nok_nodes.index)} TN is not zero, containing {len(nok_lines.index)} devices")
+    time_moment_now = datetime.now().strftime("%d-%m-%Y_%H-%M-%S")
+    file_name_all = f"all_lines_from_{time_moment_now}.csv"
+    if path_local_storage:
+        check_and_create_the_folder_path(path_local_storage)
+        file_name_all = path_local_storage.removesuffix('/') + '/' + file_name_all.removeprefix('/')
+    terminals_equipment.to_csv(file_name_all)
+    nok_tsos = (nok_lines.copy(deep=True)[['Terminal.TopologicalNode', 'modelingAuthoritySet']]
+                .drop_duplicates(subset='Terminal.TopologicalNode', keep='last')
+                .groupby('modelingAuthoritySet').size().reset_index(name='NodeCount'))
+    ok_tsos = (ok_lines.copy(deep=True)[['Terminal.TopologicalNode', 'modelingAuthoritySet']]
+               .drop_duplicates(subset='Terminal.TopologicalNode', keep='last')
+               .groupby('modelingAuthoritySet').size().reset_index(name='NodeCount'))
+    return ok_tsos, nok_tsos
+
+
 def merge_models(list_of_models: list,
                  latest_boundary: dict,
                  time_horizon: str,
@@ -354,6 +570,7 @@ def merge_models(list_of_models: list,
                  merging_area: str,
                  merging_entity: str,
                  mas: str,
+                 path_local_storage: str = None,
                  version: str = '001',
                  merge_prefix: str = 'CGM',
                  push_to_opdm: bool = False):
@@ -428,6 +645,21 @@ def merge_models(list_of_models: list,
                                   failed_buses=troublesome_buses,
                                   revert_failed_terminals=True)
 
+    try:
+        ssh_data = check_net_interchanges(cgm_sv_data=sv_data, cgm_ssh_data=ssh_data, original_models=data)
+    except KeyError:
+        logger.error(f"No fields for NetInterchange")
+
+    try:
+        tsos_ok, tsos_nok = get_pf_mismatch(cgm_sv_data=sv_data, merged_models=data,
+                                            path_local_storage=path_local_storage)
+        if not tsos_nok.empty:
+            logger.warning(f"Following TSOs have Kirchhoff 1st law errors")
+            print(tsos_nok.to_string())
+        else:
+            logger.info(f"No Kirchhoff 1st law errors detected")
+    except Exception as ex_message:
+        logger.error(f"Some error occurred: {ex_message}")
     # Package both input models and exported CGM profiles to in memory zip files
     serialized_data = export_to_cgmes_zip([ssh_data, sv_data])
 
@@ -474,13 +706,13 @@ def merge_models(list_of_models: list,
     rmm_object.name = f"{rmm_name}.zip"
     # logger.info(f"Uploading RMM to MINO {OUTPUT_MINIO_BUCKET}/{rmm_object.name}")
 
-    return rmm_object
+    return rmm_object, solved_model
 
 
 if __name__ == '__main__':
     import sys
-
-    where_to_store_stuff = r'./CGM_dump'
+    # Specify the location where to store the results (makes folder with date time of the current run)
+    where_to_store_stuff = r'E:\some_user_1\CGM_dump'
     this_run = datetime.now().strftime("%d-%m-%Y_%H-%M-%S")
     where_to_store_stuff = os.path.join(where_to_store_stuff, this_run)
 
@@ -489,44 +721,57 @@ if __name__ == '__main__':
         datefmt='%Y-%m-%dT%H:%M:%S',
         level=logging.INFO,
         handlers=[logging.StreamHandler(sys.stdout),
-                  PyPowsyblLogGatheringHandler(topic_name='cgm_merge',
-                                               send_to_elastic=False,
-                                               upload_to_minio=False,
-                                               logging_policy=PyPowsyblLogReportingPolicy.ALL_ENTRIES,
-                                               print_to_console=False,
-                                               path_to_local_folder=where_to_store_stuff,
-                                               report_level=logging.ERROR)]
-    )
-
+                  # Comment this block ini if pypowsybl logs are needed
+                  # PyPowsyblLogGatheringHandler(topic_name='cgm_merge',
+                  #                              send_to_elastic=False,
+                  #                              upload_to_minio=False,
+                  #                              logging_policy=PyPowsyblLogReportingPolicy.ALL_ENTRIES,
+                  #                              print_to_console=False,
+                  #                              path_to_local_folder=where_to_store_stuff,
+                  #                              report_level=logging.ERROR)
+                  ])
+    # Set this true if local files are used, if this is false then it takes the values in test_scenario_datetime_values
+    # and asks them from ELK+Minio
     use_local = True
+    # if use_local is true specify the path from where to get the IGMs
+    folder_to_study = r'E:\some_user_2\YR_IGM\JAN_2025'
+    # Set this true to if running through validator is needed
     validation_needed = False
+    # If result should be sent to opdm
     send_to_opdm = False
-    examples_path = None
-    folder_to_study = r'IGMS/2024-08-01-12-30-1D'
-    test_time_horizon = 'ID'
-    # test_time_horizon = '1D'
-    # test_time_horizon = '2D'
-
+    # Specify TSOs (as are in file names) who should be included, if empty then all are taken
     included_models = []
+    # Specify TSOs who should be excluded, if empty then none is excluded
     excluded_models = []
+    # if models are taken from ELK+Minio (use_local = False), specify additional TSOs that should be searched from Minio
+    # directly (synchro models)
     local_import_models = []
-    overwrite_local_date_time = True
+    # Specify time_horizon and scenario date
+    test_time_horizon = '1D'
     test_scenario_datetime_values = ['2024-08-01T12:30:00+00:00']
+    # If use_local = True and this is True then it takes scenario date, time horizon from the file names of the IGMs
+    overwrite_local_date_time = True
+    # Specify some additional parameters
     test_version = '123'
     test_merging_entity = 'BALTICRSC'
     test_merging_area = 'EU'
     test_mas = 'http://www.baltic-rsc.eu/OperationalPlanning/CGM'
+    # And now it starts to do something
     for test_scenario_datetime in test_scenario_datetime_values:
         logger.info(f"Executing {test_scenario_datetime}")
         if use_local:
             loaded_boundary = file_system.get_latest_boundary(path_to_directory=folder_to_study,
-                                                              local_folder_for_examples=examples_path)
+                                                              local_folder_for_examples=None)
             valid_models = file_system.get_latest_models_and_download(path_to_directory=folder_to_study,
-                                                                      local_folder_for_examples=examples_path)
+                                                                      local_folder_for_examples=None)
             if overwrite_local_date_time:
                 test_scenario_datetime = valid_models[0].get('pmd:scenarioDate', test_scenario_datetime)
                 test_time_horizon = valid_models[0].get('pmd:timeHorizon', test_time_horizon)
-                if test_time_horizon != '1D' and test_time_horizon != '2D':
+                try:
+                    time_horizon_value = int(test_time_horizon)
+                except ValueError:
+                    time_horizon_value = None
+                if time_horizon_value:
                     test_time_horizon = 'ID'
         else:
             loaded_boundary = models.get_latest_boundary()
@@ -571,18 +816,20 @@ if __name__ == '__main__':
         if not available_models:
             logger.error("No models to merge :(")
             sys.exit()
-
-        test_model = merge_models(list_of_models=available_models,
-                                  latest_boundary=loaded_boundary,
-                                  time_horizon=test_time_horizon,
-                                  scenario_datetime=test_scenario_datetime,
-                                  merging_area=test_merging_area,
-                                  merging_entity=test_merging_entity,
-                                  mas=test_mas,
-                                  version=test_version,
-                                  push_to_opdm=send_to_opdm)
-
         check_and_create_the_folder_path(where_to_store_stuff)
+        test_model, model_itself = merge_models(list_of_models=available_models,
+                                                latest_boundary=loaded_boundary,
+                                                time_horizon=test_time_horizon,
+                                                scenario_datetime=test_scenario_datetime,
+                                                merging_area=test_merging_area,
+                                                merging_entity=test_merging_entity,
+                                                mas=test_mas,
+                                                version=test_version,
+                                                # Comment this line in if all nodes in csv are needed
+                                                # path_local_storage=where_to_store_stuff,
+                                                push_to_opdm=send_to_opdm)
+
+
         full_name = where_to_store_stuff.removesuffix('/') + '/' + test_model.name.removeprefix('/')
         with open(full_name, 'wb') as write_file:
             write_file.write(test_model.getbuffer())

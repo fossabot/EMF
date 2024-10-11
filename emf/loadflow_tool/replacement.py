@@ -43,7 +43,11 @@ def run_replacement(tso_list: list, time_horizon: str, scenario_date: str, conf=
                 sample_tso = sample_tso.loc[(sample_tso["priority_day"] == sample_tso["priority_day"].min())]
                 sample_tso = sample_tso.loc[(sample_tso["priority_business"] == sample_tso["priority_business"].min())]
                 sample_tso = sample_tso.loc[(sample_tso["priority_hour"] == sample_tso["priority_hour"].min())]
-                sample_tso_min = sample_tso.loc[(sample_tso["pmd:versionNumber"] == sample_tso["pmd:versionNumber"].max())]
+                sample_tso = sample_tso.loc[(sample_tso["pmd:versionNumber"] == sample_tso["pmd:versionNumber"].max())]
+                sample_tso_min = sample_tso.loc[(sample_tso["pmd:creationDate"] == sample_tso["pmd:creationDate"].max())]
+                if len(sample_tso_min) > 1:
+                    logger.warning(f"Replacement filtering unreliable for: '{unique_tso}'")
+                    sample_tso_min = sample_tso_min.iloc[:1]
                 replacements = pd.concat([replacements, sample_tso_min])
 
             replacement_models = replacements.to_dict(orient='records') if not replacements.empty else None
@@ -58,6 +62,8 @@ def run_replacement(tso_list: list, time_horizon: str, scenario_date: str, conf=
             tso_missing = [model for model in tso_list if model not in unique_tsos_list]
             if tso_missing:
                 logger.info(f"No replacement models found for TSO(s): {tso_missing}")
+        else:
+            logger.error(f"No replacement models found, replacement list is empty")
     else:
         logger.info(f"No replacement models found in Elastic for TSO(s): {tso_list}")
 
