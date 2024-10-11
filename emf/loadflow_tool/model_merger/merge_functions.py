@@ -631,6 +631,8 @@ def revert_failed_buses(cgm_sv_data,
     :param revert_failed_terminals: set it true to revert the flows for terminals
     :return updated merged SV and SSH profiles
     """
+    if failed_buses is None or failed_buses.empty:
+        return cgm_sv_data
     # Check that input is triplets
     original_models = get_opdm_data_from_models(model_data=original_data)
     # Get terminals merged with nok nodes (see condition 2)
