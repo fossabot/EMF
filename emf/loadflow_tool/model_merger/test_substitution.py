@@ -1,12 +1,15 @@
+import json
 import logging
 import os
 import re
 from collections.abc import Iterable
 from datetime import datetime
 from io import BytesIO
+from uuid import uuid4
 from zipfile import ZipFile
 
 import pandas
+import requests
 
 from emf.common.integrations.elastic import Elastic
 from emf.common.integrations.object_storage.file_system import group_files_by_origin, \
@@ -16,12 +19,12 @@ from emf.common.integrations.object_storage.file_system_general import check_the
 from emf.loadflow_tool.model_merger import merge_functions
 from emf.loadflow_tool.model_merger.merge_from_local import merge_models, SMALL_ISLAND_SIZE, MERGE_LOAD_FLOW_SETTINGS, \
     PY_REPORT_ELK_INDEX
-from emf.task_generator.time_helper import parse_duration
+from emf.task_generator.time_helper import parse_duration, convert_to_utc
 import pytz
 import triplets
 import config
 import datetime
-from emf.loadflow_tool.helper import load_opdm_data, metadata_from_filename
+from emf.loadflow_tool.helper import metadata_from_filename
 from emf.task_generator.time_helper import parse_datetime
 from emf.common.config_parser import parse_app_properties
 
@@ -106,7 +109,7 @@ def calculate_scenario_datetime_and_time_horizon(given_datetime: str | datetime.
     actual_offset_duration = parse_duration(actual_offset)
     try:
         imaginary_offset_duration = parse_duration(imaginary_offset)
-    except Exception:
+    except ValueError:
         imaginary_offset_duration = None
 
     # Map 'WK' to 7 days for the default time horizon
@@ -242,7 +245,7 @@ def get_outage_matches(model_data: pandas.DataFrame, outages: pandas.DataFrame, 
     Some preliminary, bad and funky way to match the outage data to the mRIDs. If considering the filtered
     opc data most of the elements contained some number and letter combination (LN 321 for example) so get them
     and search equivalents from all the names in the model.
-    Probably the best solution would be to use some kind of external mapping but it is currently missing
+    Probably the best solution would be to use some kind of external mapping, but it is currently missing
     :param model_data: necessary IGMs (in triplets)
     :param outages: dataframe of outage data
     :param outage_name_field: name of the column in outage data to be used for mapping
@@ -366,79 +369,6 @@ def change_change_scenario_date_time_horizon_new(existing_models: list,
     return model_data
 
 
-def change_change_scenario_date_time_horizon(existing_models: list,
-                                             scenario_time_to_set: str,
-                                             time_horizon_to_set: str,
-                                             existing_outages: pandas.DataFrame = None,
-                                             outages_to_set: pandas.DataFrame = None):
-    """
-    Changes scenario dates and time horizons in the opde models
-    :param existing_models: list of opde models
-    :param scenario_time_to_set: new scenario time to use
-    :param time_horizon_to_set: new time horizon to use
-    :param existing_outages: outages that need to be reverted
-    :param outages_to_set: outages to be set
-    """
-    parsed_scenario_time = parse_datetime(scenario_time_to_set)
-
-    # Change to 'WK' if new_time_horizon is between 1D and 9D
-    if time_horizon_to_set in ['1D', '2D', '3D', '4D', '5D', '6D', '7D', '8D', '9D']:
-        time_horizon_to_set = 'WK'
-
-    for model in existing_models:
-        content_reference = None
-        for component in model.get('opde:Component'):
-            opdm_profile = component.get('opdm:Profile')
-            if not opdm_profile:
-                raise ValueError(f"Model in unknown format")
-            profile = load_opdm_data(opdm_objects=[model],
-                                     profile=opdm_profile.get('pmd:cgmesProfile'))
-            # Change scenario time in headers
-            new_scenario_string = f"{parsed_scenario_time:%Y-%m-%dT%H:%M:00Z}"
-            profile.loc[profile.query('KEY == "Model.scenarioTime"').index, 'VALUE'] = new_scenario_string
-            profile.loc[profile.query('KEY == "Model.processType"').index, 'VALUE'] = time_horizon_to_set
-
-            # Update file names:
-            file_names = profile[profile['KEY'] == 'label']
-            for index, file_name_row in file_names.iterrows():
-                file_name = file_name_row['VALUE']
-                file_name_meta = metadata_from_filename(file_name)
-                file_name_meta['pmd:validFrom'] = f"{parsed_scenario_time:%Y%m%dT%H%MZ}"
-                file_name_meta['pmd:timeHorizon'] = time_horizon_to_set  # Apply the 'WK' here
-                updated_file_name = reduced_filename_from_metadata(file_name_meta)
-                profile.loc[index, 'VALUE'] = updated_file_name
-
-            # Update outages
-            if (existing_outages is not None) or (outages_to_set is not None):
-                eic_mrid_map = get_eic_to_mrid_mapping()
-                profile = update_outages(model_data=profile,
-                                         existing_outages=existing_outages,
-                                         outages_to_set=outages_to_set,
-                                         eic_to_mrid_map=eic_mrid_map)
-            profile = triplets.cgmes_tools.update_FullModel_from_filename(profile)
-            serialized_data = export_to_cgmes_zip([profile])
-            if len(serialized_data) == 1:
-                serialized = serialized_data[0]
-                serialized.seek(0)
-                opdm_profile['DATA'] = serialized.read()
-                opdm_profile['pmd:scenarioDate'] = new_scenario_string
-                opdm_profile['pmd:timeHorizon'] = time_horizon_to_set
-                opdm_profile['pmd:fileName'] = serialized.name
-                meta_data = metadata_from_filename(serialized.name)
-                opdm_profile['pmd:content-reference'] = (f"CGMES/"
-                                                         f"{time_horizon_to_set}/"
-                                                         f"{meta_data['pmd:modelPartReference']}/"
-                                                         f"{parsed_scenario_time:%Y%m%d}/"
-                                                         f"{parsed_scenario_time:%H%M%S}/"
-                                                         f"{meta_data['pmd:cgmesProfile']}/"
-                                                         f"{serialized.name}")
-                if not content_reference:
-                    content_reference = opdm_profile['pmd:content-reference']
-        if content_reference:
-            model['pmd:content-reference'] = content_reference
-    return existing_models
-
-
 def check_and_create_the_folder_path(folder_path: str):
     """
     Checks if folder path doesn't have any excessive special characters and it exists. Creates it if it does not
@@ -495,7 +425,7 @@ def save_model_to_minio(data,
 
     :param data: data to be saved to minio
     :param data_file_name: data file name
-    :param minio_bucket: name of minio bucket
+    :param minio_bucket: minio bucket
     :param subfolder_name: prefix for the files if needed (set to RCC_WK_IGMS)
     :param save_minio_service: minio instance if given, created otherwise
     """
@@ -534,7 +464,6 @@ def get_week_ahead_models(bucket_name, prefix, current_scenario_date):
                 # if date is 20240907T0830Z then corresponding regex would be:
                 # fixed \d{8}T\d{4}Z or varying \d+T\d+Z
                 scenario_datetime_pattern = r'(\d+T\d+Z)'
-                key_pattern = r''
                 # date_to_str = model.object_name.split('-')[3]
                 date_to_str_match = re.search(scenario_datetime_pattern, model.object_name)
                 if not date_to_str_match:
@@ -563,7 +492,7 @@ def get_week_ahead_models(bucket_name, prefix, current_scenario_date):
                     # If the key doesn't exist or the current model has a higher version, update the latest model
                     if key not in latest_models or latest_models[key]['version'] < version_number:
                         latest_models[key] = {'version': version_number, 'object_name': model.object_name}
-            except Exception:
+            except KeyError:
                 logger.error(f"Unable to parse {model.object_name}")
 
     # Collect the latest models into the retrieved_models list
@@ -619,7 +548,7 @@ def get_tso_name_from_string(str_value):
         if regex_match:
             return regex_match
         return None
-    except Exception:
+    except AttributeError:
         return None
 
 
@@ -770,7 +699,7 @@ def get_eic_to_mrid_mapping(elastic_index: str = 'config-network-elements*',
     :return pandas.Dataframe
     """
     if not field_names:
-        field_names = ['EIC', 'mRID']
+        field_names = ['eic', 'mrid']
     query_part = {"match_all": {}}
     try:
         elastic_client = Elastic()
@@ -788,6 +717,76 @@ def get_eic_to_mrid_mapping(elastic_index: str = 'config-network-elements*',
     return pandas.DataFrame
 
 
+def generate_sample_task(task_scenario_date,
+                         task_included_models,
+                         task_excluded_models: list = None,
+                         task_models_from_minio: list = None,
+                         task_time_horizon: str = "WK",
+                         task_merging_area: str = 'BA',
+                         task_merging_entity: str = 'BALTICRSC',
+                         task_version_number: str = "101",
+                         task_mas_name: str = "http://www.baltic-rsc.eu/OperationalPlanning/CGM",
+                         task_replace: bool = False,
+                         task_scale: bool = False,
+                         task_to_opdm: bool = False,
+                         task_to_minio: bool = False,
+                         task_send_report: bool = False):
+    created_at = datetime.datetime.utcnow()
+    task_creation_time = created_at.isoformat()
+    task_duration = 'PT1H'
+    task_gate = 'PT15M'
+    job_period_start = convert_to_utc(created_at)
+    job_gate_start = convert_to_utc(created_at)
+    job_gate_end = convert_to_utc(job_gate_start + parse_duration(task_gate))
+    job_period_end = convert_to_utc(job_period_start + parse_duration(task_duration))
+
+    if not task_excluded_models:
+        task_excluded_models = []
+    if not task_models_from_minio:
+        task_models_from_minio = []
+    return {
+        "@context": "https://example.com/task_context.jsonld",
+        "@type": "Task",
+        "@id": f"urn:uuid:{str(uuid4())}",
+        "process_id": "https://example.com/processes/CGM_CREATION",
+        "run_id": "https://example.com/runs/IntraDayCGM/1",
+        "job_id": f"urn:uuid:{str(uuid4())}",
+        "task_type": "manual",
+        "task_initiator": os.getlogin(),
+        "task_priority": "normal",
+        "task_creation_time": task_creation_time,
+        "task_update_time": task_creation_time,
+        "task_status": "created",
+        "task_status_trace": [
+            {"status": "created", "timestamp": task_creation_time}
+        ],
+        "task_dependencies": [],
+        "task_tags": [],
+        "task_retry_count": 0,
+        "task_timeout": task_duration,
+        "task_gate_open": job_gate_start.isoformat(),
+        "task_gate_close": job_gate_end.isoformat(),
+        "job_period_start": job_period_start.isoformat(),
+        "job_period_end": job_period_end.isoformat(),
+        "task_properties": {
+            "timestamp_utc": task_scenario_date,
+            "merge_type": task_merging_area,
+            "merging_entity": task_merging_entity,
+            "included": task_included_models,
+            "excluded": task_excluded_models,
+            "local_import": task_models_from_minio,
+            "time_horizon": task_time_horizon,
+            "version": task_version_number,
+            "mas": task_mas_name,
+            "replacement": str(task_replace).lower(),
+            "scaling": str(task_scale).lower(),
+            "upload_to_opdm": str(task_to_opdm).lower(),
+            "upload_to_minio": str(task_to_minio).lower(),
+            "send_merge_report": str(task_send_report).lower()
+        }
+    }
+
+
 if __name__ == "__main__":
 
     import sys
@@ -803,7 +802,7 @@ if __name__ == "__main__":
                  'AST': ['LV', '43'],
                  'LITGRID': ['LT', '41'],
                  'PSE': ['PL', '19']}
-    new_final_time_horizon = "WK"
+
     merge_prefix = 'RMM'
     minio_merged_folder = f"EMFOS/{merge_prefix}"
     test_version = '123'
@@ -812,7 +811,7 @@ if __name__ == "__main__":
     test_mas = 'http://www.baltic-rsc.eu/OperationalPlanning/CGM'
 
     minio_service = minio.ObjectStorage()
-    current_scenario_date = "2024-10-09T08:30:00+00:00"
+    start_scenario_date = "2024-10-10T08:30:00+00:00"
     existing_time_horizons = ['1D', '2D']
     virtual_time_horizons = ['3D', '4D', '5D', '6D', '7D', '8D', '9D']
     included_models = [
@@ -839,71 +838,19 @@ if __name__ == "__main__":
     # opc_end_date_field = 'end_date'
     # opc_eic_column_name = 'EIC'
 
-    save_to_local = False
-    save_to_minio = False
-    save_cgm_to_minio = False
-    save_cgm_to_local = True
-    save_merge_report = False
-
-    current_timestamp = datetime.datetime.now()
-    sample_task = {
-        "@context": "https://example.com/task_context.jsonld",
-        "@type": "Task",
-        "@id": f"urn:uuid:ee3c57bf-fa4e-402c-82ac-7352c0d8e118",
-        "process_id": "https://example.com/processes/CGM_CREATION",
-        "run_id": "https://example.com/runs/IntraDayCGM/1",
-        "job_id": "urn:uuid:d9343f48-23cd-4d8a-ae69-1940a0ab1837",
-        "task_type": "manual",
-        "task_initiator": "weekly_merge",
-        "task_priority": "normal",
-        "task_creation_time": "2024-05-28T20:39:42.448064",
-        "task_update_time": "",
-        "task_status": "created",
-        "task_status_trace": [
-            {"status": "created", "timestamp": "2024-05-28T20:39:42.448064"}
-        ],
-        "task_dependencies": [],
-        "task_tags": [],
-        "task_retry_count": 0,
-        "task_timeout": "PT1H",
-        "task_gate_open": "2024-05-24T21:00:00+00:00",
-        "task_gate_close": "2024-05-24T21:15:00+00:00",
-        "job_period_start": "2024-05-24T22:00:00+00:00",
-        "job_period_end": "2024-05-25T06:00:00+00:00",
-        "task_properties": {
-            "timestamp_utc": current_scenario_date,
-            "merge_type": test_merging_area,
-            "merging_entity": test_merging_entity,
-            "included": [*included_models, *included_models_from_minio],
-            "excluded": [],
-            "local_import": included_models_from_minio,
-            "time_horizon": new_final_time_horizon,
-            "version": test_version,
-            "mas": test_mas,
-            "replacement": "True",      # TODO: ?
-            "scaling": "False",         # TODO: ?
-            "upload_to_opdm": "False",
-            "upload_to_minio": save_cgm_to_minio,
-            "send_merge_report": save_merge_report
-        }
-    }
-
-    start_time = datetime.datetime.utcnow()
-
     elastic_index_for_mapping = 'config-network-elements*'
-    eic_mrid_map = get_eic_to_mrid_mapping(elastic_index_for_mapping)
     eic_mrid_map_eic = 'eic'
     eic_mrid_map_mrid = 'mrid'
-
+    eic_mrid_map = get_eic_to_mrid_mapping(elastic_index_for_mapping, field_names=[eic_mrid_map_eic, eic_mrid_map_mrid])
     retrieved_WK_files = get_week_ahead_models(bucket_name='opde-confidential-models',
                                                prefix='IGM',
-                                               current_scenario_date=current_scenario_date)
+                                               current_scenario_date=start_scenario_date)
 
     # The 'retrieved_files' list will contain all matching future files with the latest version
     print("\nRetrieved future files with latest versions list:", retrieved_WK_files)
 
     all_horizons = [*existing_time_horizons, *virtual_time_horizons]
-    some_results = calculate_scenario_datetime_and_time_horizon_by_shifts(given_datetime=current_scenario_date,
+    some_results = calculate_scenario_datetime_and_time_horizon_by_shifts(given_datetime=start_scenario_date,
                                                                           time_horizons=all_horizons,
                                                                           shifts=shift_mapping,
                                                                           # Change this back, during daytime no next day
@@ -916,7 +863,11 @@ if __name__ == "__main__":
     existing_folder = os.path.join(existing_folder, current_run)
     # existing_folder = './existing'
 
-
+    save_to_local = False
+    save_to_minio = False
+    save_cgm_to_minio = True
+    save_cgm_to_local = True
+    send_merge_report_to_elk = True
     print(pandas.DataFrame(some_results.values()).to_string())
     special_case_time_horizon = 'WK'
     for result in some_results:
@@ -925,23 +876,23 @@ if __name__ == "__main__":
         old_scenario_date = some_results[result].get('existing_time_scenario')
         new_time_horizon = some_results[result].get('future_time_horizon')
         new_scenario_date = some_results[result].get('future_time_scenario')
-
-        merge_log = {"uploaded_to_opde": 'False',
-                     "uploaded_to_minio": 'False',
-                     "scaled": 'False',
+        sample_task = generate_sample_task(task_scenario_date=new_scenario_date,
+                                           task_included_models=[*included_models_from_minio, *included_models],
+                                           task_models_from_minio=included_models_from_minio,
+                                           task_time_horizon=new_time_horizon,
+                                           task_merging_area=test_merging_area,
+                                           task_merging_entity=test_merging_entity,
+                                           task_version_number=test_version,
+                                           task_mas_name=test_mas,
+                                           task_to_minio=save_cgm_to_minio,
+                                           task_send_report=send_merge_report_to_elk)
+        merge_log = {"uploaded_to_opde": 'false',
+                     "uploaded_to_minio": 'false',
+                     "scaled": 'false',
                      "exclusion_reason": [],
-                     "replacement": 'False',
+                     "replacement": 'false',
                      "replaced_entity": [],
                      "replacement_reason": []}
-        # Go to original data
-        # outage_reports = get_opc_data(opc_start_datetime=new_scenario_date,
-        #                               index_name='opc-report*',
-        #                               start_datetime_field_name='TimeSeries.outage_Period.timeInterval.start',
-        #                               end_date_time_field_name='TimeSeries.outage_Period.timeInterval.end')
-        # outage_tso_codes = [*tso_codes.values()]
-        # outage_tso_codes = flatten_list(outage_tso_codes)
-        # outage_reports_filtered = outage_reports[
-        #     outage_reports['TimeSeries.RegisteredResource.mRID.#text'].str.slice(stop=2).isin(outage_tso_codes)]
 
         logger.info(f"Processing {new_scenario_date}")
         # 1. Take all existing models from minio opde-confidential-models/IGM
@@ -970,9 +921,9 @@ if __name__ == "__main__":
                                                                  scenario_date=old_scenario_date,
                                                                  tso=included_models[0])
             else:
-                models = get_latest_models_and_download(time_horizon=old_time_horizon,
-                                                        scenario_date=old_scenario_date)
-                filtered_models = filter_models(models, included_models, filter_on='pmd:TSO')
+                prefiltered_models = get_latest_models_and_download(time_horizon=old_time_horizon,
+                                                                    scenario_date=old_scenario_date)
+                filtered_models = filter_models(prefiltered_models, included_models, filter_on='pmd:TSO')
             if filtered_models:
                 opdm_tsos = [model.get('pmd:TSO') for model in filtered_models]
                 existing_tsos.extend(opdm_tsos)
@@ -1065,7 +1016,7 @@ if __name__ == "__main__":
                 merge_log.get('replaced_entity').append({'tso': updated_tso,
                                                          'replacement_time_horizon': old_time_horizon,
                                                          'replacement_scenario_date': old_scenario_date})
-            merge_log.update({'replacement': 'True'})
+            merge_log.update({'replacement': 'true'})
         print(len(weekly_models))
         missing_tsos = [tso for tso in [*included_models, *included_models_from_minio] if tso not in existing_tsos]
         merge_log.get('exclusion_reason').extend(
@@ -1096,7 +1047,7 @@ if __name__ == "__main__":
             save_model_to_minio(data=test_model,
                                 subfolder_name=minio_merged_folder,
                                 data_file_name=test_model.name)
-            merge_log.update({'uploaded_to_minio': 'True'})
+            merge_log.update({'uploaded_to_minio': 'true'})
         file_name_bare = test_model.name.removesuffix('.zip')
         file_name_full = f"{minio_merged_folder}/{file_name_bare}.zip"
 
@@ -1106,12 +1057,19 @@ if __name__ == "__main__":
                           'merge_duration': f'{(merge_end - merge_start).total_seconds()}',
                           'content_reference': file_name_full,
                           'cgm_name': file_name_bare})
+
         try:
             merge_report = merge_functions.generate_merge_report(test_network, weekly_models, merge_log)
             try:
-                if save_merge_report:
+                if send_merge_report_to_elk:
                     response = elastic.Elastic.send_to_elastic(index=PY_REPORT_ELK_INDEX,
                                                                json_message=merge_report)
+                    if response.status_code != requests.codes.OK and response.status_code != requests.codes.created:
+                        logger.error(f"Unable to upload report to elastic: {response.text}")
+                else:
+                    json_file_name = (existing_folder.removesuffix('/') + '/' +
+                                      test_model.name.removeprefix('/').remove.suffix('.zip') + '.json')
+                    json.dump(merge_report, open(json_file_name, 'w'))
             except Exception as error:
                 logger.error(f"Merge report sending to Elastic failed: {error}")
         except Exception as error:
