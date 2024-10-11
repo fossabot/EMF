@@ -13,7 +13,9 @@ from emf.common.integrations.object_storage.file_system import group_files_by_or
     get_one_set_of_igms_from_local_storage, get_one_set_of_boundaries_from_local_storage, \
     save_merged_model_to_local_storage
 from emf.common.integrations.object_storage.file_system_general import check_the_folder_path
-from emf.loadflow_tool.model_merger.merge_from_local import merge_models
+from emf.loadflow_tool.model_merger import merge_functions
+from emf.loadflow_tool.model_merger.merge_from_local import merge_models, SMALL_ISLAND_SIZE, MERGE_LOAD_FLOW_SETTINGS, \
+    PY_REPORT_ELK_INDEX
 from emf.task_generator.time_helper import parse_duration
 import pytz
 import triplets
@@ -24,9 +26,9 @@ from emf.task_generator.time_helper import parse_datetime
 from emf.common.config_parser import parse_app_properties
 
 try:
-    from emf.common.integrations import minio
+    from emf.common.integrations import minio, elastic
 except ImportError:
-    from emf.common.integrations import minio_api as minio
+    from emf.common.integrations import elastic, minio_api as minio
 from emf.common.integrations.object_storage.models import get_latest_models_and_download, get_latest_boundary
 from emf.loadflow_tool.model_merger.merge_functions import filter_models, export_to_cgmes_zip, get_opdm_data_from_models
 
@@ -274,7 +276,9 @@ def update_outages(model_data: pandas.DataFrame,
                    outages_to_set: pandas.DataFrame,
                    eic_to_mrid_map: pandas.DataFrame,
                    outage_name_field: str = 'name',
-                   eic_codes_column: str = 'EIC'):
+                   outage_eic_codes_column: str = 'EIC',
+                   mrid_eic_codes_column: str = 'eic',
+                   mrid_mrid_codes_column: str = 'mrid'):
     """
     Links outages to devices in igm, gets difference of the outages from the old scenario date and new scenario date
     Switches on devices which outages will be expired in future and switches of devices that will go to outages
@@ -283,8 +287,10 @@ def update_outages(model_data: pandas.DataFrame,
     :param outages_to_set: dataframe of outage data for a future timestamp that the model will represent
     :param outage_name_field:
     :param eic_to_mrid_map: map
-    :param eic_codes_column:
-    :return updated model_data
+    :param outage_eic_codes_column:
+    :param mrid_eic_codes_column:
+    :param mrid_mrid_codes_column:
+    return updated model_data
     """
     model_data = get_opdm_data_from_models(model_data)
     if eic_to_mrid_map.empty:
@@ -296,14 +302,14 @@ def update_outages(model_data: pandas.DataFrame,
                                            outage_name_field=outage_name_field)
     else:
         column_headings = eic_to_mrid_map.columns.values.tolist()
-        if 'mRID' in column_headings and 'ID' not in column_headings:
-            eic_to_mrid_map = eic_to_mrid_map.rename(columns={'mRID': 'ID'})
-        existing_lines = existing_outages[[eic_codes_column]].merge(eic_to_mrid_map,
-                                                                    left_on=eic_codes_column,
-                                                                    right_on='EIC')
-        updated_lines = outages_to_set[[eic_codes_column]].merge(eic_to_mrid_map,
-                                                                 left_on=eic_codes_column,
-                                                                 right_on='EIC')
+        if "ID" not in column_headings and mrid_mrid_codes_column != "ID":
+            eic_to_mrid_map = eic_to_mrid_map.rename(columns={mrid_mrid_codes_column: 'ID'})
+        existing_lines = existing_outages[[outage_eic_codes_column]].merge(eic_to_mrid_map,
+                                                                           left_on=outage_eic_codes_column,
+                                                                           right_on=mrid_eic_codes_column)
+        updated_lines = outages_to_set[[outage_eic_codes_column]].merge(eic_to_mrid_map,
+                                                                        left_on=outage_eic_codes_column,
+                                                                        right_on=mrid_eic_codes_column)
     # Tricky part: get changes
     changes = existing_lines.merge(updated_lines, on='ID', how='outer', suffixes=('_PRE', '_POST'), indicator=True)
     # Get those devices that will come to service
@@ -797,7 +803,7 @@ if __name__ == "__main__":
                  'AST': ['LV', '43'],
                  'LITGRID': ['LT', '41'],
                  'PSE': ['PL', '19']}
-
+    new_final_time_horizon = "WK"
     merge_prefix = 'RMM'
     minio_merged_folder = f"EMFOS/{merge_prefix}"
     test_version = '123'
@@ -833,8 +839,61 @@ if __name__ == "__main__":
     # opc_end_date_field = 'end_date'
     # opc_eic_column_name = 'EIC'
 
+    save_to_local = False
+    save_to_minio = False
+    save_cgm_to_minio = False
+    save_cgm_to_local = True
+    save_merge_report = False
+
+    current_timestamp = datetime.datetime.now()
+    sample_task = {
+        "@context": "https://example.com/task_context.jsonld",
+        "@type": "Task",
+        "@id": f"urn:uuid:ee3c57bf-fa4e-402c-82ac-7352c0d8e118",
+        "process_id": "https://example.com/processes/CGM_CREATION",
+        "run_id": "https://example.com/runs/IntraDayCGM/1",
+        "job_id": "urn:uuid:d9343f48-23cd-4d8a-ae69-1940a0ab1837",
+        "task_type": "manual",
+        "task_initiator": "weekly_merge",
+        "task_priority": "normal",
+        "task_creation_time": "2024-05-28T20:39:42.448064",
+        "task_update_time": "",
+        "task_status": "created",
+        "task_status_trace": [
+            {"status": "created", "timestamp": "2024-05-28T20:39:42.448064"}
+        ],
+        "task_dependencies": [],
+        "task_tags": [],
+        "task_retry_count": 0,
+        "task_timeout": "PT1H",
+        "task_gate_open": "2024-05-24T21:00:00+00:00",
+        "task_gate_close": "2024-05-24T21:15:00+00:00",
+        "job_period_start": "2024-05-24T22:00:00+00:00",
+        "job_period_end": "2024-05-25T06:00:00+00:00",
+        "task_properties": {
+            "timestamp_utc": current_scenario_date,
+            "merge_type": test_merging_area,
+            "merging_entity": test_merging_entity,
+            "included": [*included_models, *included_models_from_minio],
+            "excluded": [],
+            "local_import": included_models_from_minio,
+            "time_horizon": new_final_time_horizon,
+            "version": test_version,
+            "mas": test_mas,
+            "replacement": "True",      # TODO: ?
+            "scaling": "False",         # TODO: ?
+            "upload_to_opdm": "False",
+            "upload_to_minio": save_cgm_to_minio,
+            "send_merge_report": save_merge_report
+        }
+    }
+
+    start_time = datetime.datetime.utcnow()
+
     elastic_index_for_mapping = 'config-network-elements*'
     eic_mrid_map = get_eic_to_mrid_mapping(elastic_index_for_mapping)
+    eic_mrid_map_eic = 'eic'
+    eic_mrid_map_mrid = 'mrid'
 
     retrieved_WK_files = get_week_ahead_models(bucket_name='opde-confidential-models',
                                                prefix='IGM',
@@ -857,10 +916,7 @@ if __name__ == "__main__":
     existing_folder = os.path.join(existing_folder, current_run)
     # existing_folder = './existing'
 
-    save_to_local = False
-    save_to_minio = False
-    save_cgm_to_minio = False
-    save_cgm_to_local = True
+
     print(pandas.DataFrame(some_results.values()).to_string())
     special_case_time_horizon = 'WK'
     for result in some_results:
@@ -870,6 +926,13 @@ if __name__ == "__main__":
         new_time_horizon = some_results[result].get('future_time_horizon')
         new_scenario_date = some_results[result].get('future_time_scenario')
 
+        merge_log = {"uploaded_to_opde": 'False',
+                     "uploaded_to_minio": 'False',
+                     "scaled": 'False',
+                     "exclusion_reason": [],
+                     "replacement": 'False',
+                     "replaced_entity": [],
+                     "replacement_reason": []}
         # Go to original data
         # outage_reports = get_opc_data(opc_start_datetime=new_scenario_date,
         #                               index_name='opc-report*',
@@ -984,7 +1047,9 @@ if __name__ == "__main__":
                                                 existing_outages=old_filtered_outages,
                                                 outages_to_set=new_filtered_outages,
                                                 eic_to_mrid_map=eic_mrid_map,
-                                                eic_codes_column=opc_eic_column_name,
+                                                outage_eic_codes_column=opc_eic_column_name,
+                                                mrid_mrid_codes_column=eic_mrid_map_mrid,
+                                                mrid_eic_codes_column=eic_mrid_map_eic,
                                                 outage_name_field=opc_name_field)
             updated_serialized_data = export_to_cgmes_zip([updated_models])
             updated_model_data, _ = group_files_by_origin(list_of_files=updated_serialized_data)
@@ -997,28 +1062,60 @@ if __name__ == "__main__":
                 if save_to_minio:
                     save_model_to_minio(data=wk_model_zip, data_file_name=wk_model_zip.name)
                 weekly_models.append(wk_model_zip)
+                merge_log.get('replaced_entity').append({'tso': updated_tso,
+                                                         'replacement_time_horizon': old_time_horizon,
+                                                         'replacement_scenario_date': old_scenario_date})
+            merge_log.update({'replacement': 'True'})
         print(len(weekly_models))
+        missing_tsos = [tso for tso in [*included_models, *included_models_from_minio] if tso not in existing_tsos]
+        merge_log.get('exclusion_reason').extend(
+            [{'tso': tso, 'reason': 'Model missing from Minio'} for tso in missing_tsos])
         weekly_models, boundary = package_models_for_pypowsybl(list_of_zip=weekly_models)
         if not boundary:
             # boundary = get_latest_boundary()
             boundary = get_latest_boundary_from_minio()
-
-        test_model = merge_models(list_of_models=weekly_models,
-                                  latest_boundary=boundary,
-                                  time_horizon=special_case_time_horizon,
-                                  scenario_datetime=new_scenario_date,
-                                  merging_area=test_merging_area,
-                                  merging_entity=test_merging_entity,
-                                  merge_prefix=merge_prefix,
-                                  mas=test_mas,
-                                  version=test_version)
+        merge_start = datetime.datetime.utcnow()
+        test_model, test_network = merge_models(list_of_models=weekly_models,
+                                                latest_boundary=boundary,
+                                                time_horizon=special_case_time_horizon,
+                                                scenario_datetime=new_scenario_date,
+                                                merging_area=test_merging_area,
+                                                merging_entity=test_merging_entity,
+                                                merge_prefix=merge_prefix,
+                                                mas=test_mas,
+                                                version=test_version)
+        merge_end = datetime.datetime.utcnow()
         if save_cgm_to_local:
             check_and_create_the_folder_path(existing_folder)
             full_name = existing_folder.removesuffix('/') + '/' + test_model.name.removeprefix('/')
             with open(full_name, 'wb') as write_file:
                 write_file.write(test_model.getbuffer())
+        # Do we need to update it to opde also
+        # merge_log.update({'uploaded_to_opde': 'True'})
         if save_cgm_to_minio:
             save_model_to_minio(data=test_model,
                                 subfolder_name=minio_merged_folder,
                                 data_file_name=test_model.name)
+            merge_log.update({'uploaded_to_minio': 'True'})
+        file_name_bare = test_model.name.removesuffix('.zip')
+        file_name_full = f"{minio_merged_folder}/{file_name_bare}.zip"
+
+        merge_log.update({'task': sample_task,
+                          'small_island_size': SMALL_ISLAND_SIZE,
+                          'loadflow_settings': MERGE_LOAD_FLOW_SETTINGS,
+                          'merge_duration': f'{(merge_end - merge_start).total_seconds()}',
+                          'content_reference': file_name_full,
+                          'cgm_name': file_name_bare})
+        try:
+            merge_report = merge_functions.generate_merge_report(test_network, weekly_models, merge_log)
+            try:
+                if save_merge_report:
+                    response = elastic.Elastic.send_to_elastic(index=PY_REPORT_ELK_INDEX,
+                                                               json_message=merge_report)
+            except Exception as error:
+                logger.error(f"Merge report sending to Elastic failed: {error}")
+        except Exception as error:
+            logger.error(f"Failed to create merge report: {error}")
+
         logger.info(f"{new_scenario_date} DONE")
+    logger.info("ALL DONE")
