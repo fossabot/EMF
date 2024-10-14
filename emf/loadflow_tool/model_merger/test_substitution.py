@@ -1049,7 +1049,8 @@ if __name__ == "__main__":
                                 subfolder_name=minio_merged_folder,
                                 data_file_name=test_model.name)
             merge_log.update({'uploaded_to_minio': 'true'})
-        file_name_bare = test_model.name.removesuffix('.zip')
+        # Just in case remove the path and extension
+        file_name_bare = (os.path.basename(test_model.name)).removesuffix('.zip')
         file_name_full = f"{minio_merged_folder}/{file_name_bare}.zip"
 
         merge_log.update({'task': sample_task,
