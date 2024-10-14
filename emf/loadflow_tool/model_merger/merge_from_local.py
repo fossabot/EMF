@@ -678,8 +678,8 @@ def merge_models(list_of_models: list,
     rmm_name = (f"{merge_prefix}_{time_horizon}_{version}_{parse_datetime(scenario_datetime):%Y%m%dT%H%MZ}"
                 f"_{merging_area}_{uuid4()}")
     # Exclude following profiles from the IGMS
-    # excluded_profiles = ['SV', 'SSH']
-    excluded_profiles = []
+    excluded_profiles = ['SV', 'SSH']
+    # excluded_profiles = []
     rmm_data = BytesIO()
     with (ZipFile(rmm_data, "w") as rmm_zip):
 
