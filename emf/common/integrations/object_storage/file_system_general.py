@@ -69,7 +69,7 @@ def get_meta_from_filename(file_name: str):
         for key in BOUNDARY_FILE_TYPE_FIX:
             if key in fixed_file_name:
                 fixed_file_name = fixed_file_name.replace(key, BOUNDARY_FILE_TYPE_FIX[key])
-        meta_data = metadata_from_filename(fixed_file_name)
+        meta_data = metadata_from_filename(os.path.basename(fixed_file_name))
         # Revert back cases where there is a '-' in TSO's name like ENTSO-E
         for case in SPECIAL_TSO_NAME:
             if case in fixed_file_name:
