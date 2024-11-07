@@ -7,6 +7,7 @@ from io import BytesIO
 from time import sleep
 from uuid import uuid4
 from zipfile import ZipFile
+from enum import Enum
 
 import pandas
 import pypowsybl.network
@@ -222,7 +223,8 @@ def revert_failed_buses(cgm_sv_data,
                                                       original_models=original_models,
                                                       sv_injection_limit=sv_injection_limit)
     # Filter buses that failed (see condition 1)
-    types = {'status': [pypowsybl.loadflow.ComponentStatus.FAILED, pypowsybl.loadflow.ComponentStatus.NO_CALCULATION]}
+    types = {'status': [get_str_from_enum(pypowsybl.loadflow.ComponentStatus.FAILED),
+                        get_str_from_enum(pypowsybl.loadflow.ComponentStatus.NO_CALCULATION)]}
     failed_buses = failed_buses.merge(pandas.DataFrame(types), on='status')
     if failed_buses.empty:
         return cgm_sv_data
@@ -426,6 +428,21 @@ def handle_not_retained_switches_between_nodes(original_data, open_not_retained_
     return original_data, updated_switches
 
 
+def get_str_from_enum(input_value):
+    """
+    Tries to parse the input to string
+    :param input_value:input string
+    """
+    if isinstance(input_value, str):
+        return input_value
+    if isinstance(input_value, Enum):
+        return input_value.name
+    try:
+        return input_value.name
+    except AttributeError:
+        return input_value
+
+
 def get_failed_buses(load_flow_results: list, network_instance: pypowsybl.network, fail_types=None):
     """
     Gets dataframe of failed buses for postprocessing
@@ -435,20 +452,24 @@ def get_failed_buses(load_flow_results: list, network_instance: pypowsybl.networ
     :return dataframe of failed buses
     """
     if not fail_types:
-        fail_types = [pypowsybl.loadflow.ComponentStatus.FAILED,
-                      pypowsybl.loadflow.ComponentStatus.NO_CALCULATION,
-                      pypowsybl.loadflow.ComponentStatus.CONVERGED,
-                      pypowsybl.loadflow.ComponentStatus.MAX_ITERATION_REACHED,
-                      # pypowsybl.loadflow.ComponentStatus.SOLVER_FAILED
+        fail_types = [get_str_from_enum(pypowsybl.loadflow.ComponentStatus.FAILED),
+                      get_str_from_enum(pypowsybl.loadflow.ComponentStatus.NO_CALCULATION),
+                      get_str_from_enum(pypowsybl.loadflow.ComponentStatus.CONVERGED),
+                      get_str_from_enum(pypowsybl.loadflow.ComponentStatus.MAX_ITERATION_REACHED),
+                      # get_str_from_enum(pypowsybl.loadflow.ComponentStatus.SOLVER_FAILED)
                       ]
     max_iteration = len([result for result in load_flow_results
-                         if result['status'] == pypowsybl.loadflow.ComponentStatus.MAX_ITERATION_REACHED])
+                         if get_str_from_enum(result['status'])
+                         == get_str_from_enum(pypowsybl.loadflow.ComponentStatus.MAX_ITERATION_REACHED)])
     successful = len([result for result in load_flow_results
-                      if result['status'] == pypowsybl.loadflow.ComponentStatus.CONVERGED])
+                      if get_str_from_enum(result['status'])
+                      == get_str_from_enum(pypowsybl.loadflow.ComponentStatus.CONVERGED)])
     not_calculated = len([result for result in load_flow_results
-                          if result['status'] == pypowsybl.loadflow.ComponentStatus.NO_CALCULATION])
+                          if get_str_from_enum(result['status'])
+                          == get_str_from_enum(pypowsybl.loadflow.ComponentStatus.NO_CALCULATION)])
     failed = len([result for result in load_flow_results
-                  if result['status'] == pypowsybl.loadflow.ComponentStatus.FAILED])
+                  if get_str_from_enum(result['status'])
+                  == get_str_from_enum(pypowsybl.loadflow.ComponentStatus.FAILED)])
     sum_of_messages = len(load_flow_results) - successful - failed - not_calculated - max_iteration
     messages = [f"Networks: {len(load_flow_results)}"]
     if successful:
@@ -466,7 +487,9 @@ def get_failed_buses(load_flow_results: list, network_instance: pypowsybl.networ
         logger.error(message)
     else:
         logger.info(message)
-    troublesome_buses = pandas.DataFrame([result for result in load_flow_results if result['status'] in fail_types])
+    troublesome_buses = pandas.DataFrame([result for result in load_flow_results
+                                          if get_str_from_enum(result['status']) in fail_types])
+
     # troublesome_buses = pandas.concat([failed, not_calculated])
     if not troublesome_buses.empty:
         troublesome_buses = (network_instance.get_buses().reset_index()
@@ -660,7 +683,7 @@ def merge_models(list_of_models: list,
                                                         merging_area=merging_area,
                                                         merging_entity=merging_entity,
                                                         mas=mas,
-                                                        # export_parameters=model_export_parameters
+                                                        export_parameters=model_export_parameters
                                                         )
 
     # Fix SV

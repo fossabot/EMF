@@ -100,7 +100,7 @@ def update_FullModel_from_OpdmObject(data, opdm_object):
     })
 
 
-def create_sv_and_updated_ssh(merged_model, original_models, scenario_date, time_horizon, version, merging_area, merging_entity, mas):
+def create_sv_and_updated_ssh(merged_model, original_models, scenario_date, time_horizon, version, merging_area, merging_entity, mas, export_parameters):
 
     ### SV ###
     # Set Metadata
@@ -116,7 +116,9 @@ def create_sv_and_updated_ssh(merged_model, original_models, scenario_date, time
                                                profile="SV")
 
 
-    exported_model = export_model(merged_model["network"], opdm_object_meta, ["SV"])
+    exported_model = export_model(merged_model["network"], opdm_object_meta, ["SV"],
+                                  export_parameters
+                                  )
     logger.info(f"Exporting merged model to {exported_model.name}")
 
     # Load SV data
@@ -135,8 +137,7 @@ def create_sv_and_updated_ssh(merged_model, original_models, scenario_date, time
         existing_values = sv_data.merge(naming_strategy, left_on='VALUE', right_on='CgmesUuid')
         existing_values = existing_values[existing_values['IidmId'] != 'unknown']
         if not existing_values.empty:
-            logger.warning(f"Mapping {len(existing_values.index)} ids back:")
-            print(existing_values[['CgmesUuid', 'IidmId']])
+            logger.warning(f"Mapping {len(existing_values.index)} ids back")
             existing_values['VALUE'] = existing_values['IidmId']
             new_existing_values = existing_values[['ID', 'KEY', 'VALUE', 'INSTANCE_ID']]
             sv_data = triplets.rdf_parser.update_triplet_from_triplet(sv_data, new_existing_values)
@@ -160,7 +161,7 @@ def create_sv_and_updated_ssh(merged_model, original_models, scenario_date, time
     ssh_data.set_VALUE_at_KEY('Model.scenarioTime', opdm_object_meta['pmd:scenarioDate'])
 
     # Load full original data to fix issues
-    data = load_opdm_data(original_models)
+    data = get_opdm_data_from_models(original_models)
     terminals = data.type_tableview("Terminal")
 
     # Update SSH data from SV
@@ -203,13 +204,16 @@ def create_sv_and_updated_ssh(merged_model, original_models, scenario_date, time
         }
     ]
     # Load terminal from original data
-    terminals = load_opdm_data(original_models).type_tableview("Terminal")
+    # terminals = load_opdm_data(original_models).type_tableview("Terminal")
 
     # Update
     for update in ssh_update_map:
         logger.info(f"Updating: {update['from_attribute']} -> {update['to_attribute']}")
-        source_data = sv_data.type_tableview(update['from_class']).reset_index(drop=True)
-
+        try:
+            source_data = sv_data.type_tableview(update['from_class']).reset_index(drop=True)
+        except AttributeError:
+            logger.error(f"Merged SV profile doesn't contain {update['from_class']} instances")
+            continue
         # Merge with terminal, if needed
         if terminal_reference := [column_name if ".Terminal" in column_name else None for column_name in source_data.columns][0]:
             source_data = source_data.merge(terminals, left_on=terminal_reference, right_on='ID')
@@ -245,7 +249,7 @@ def create_sv_and_updated_ssh(merged_model, original_models, scenario_date, time
     filename_mask = "{scenarioTime:%Y%m%dT%H%MZ}_{processType}_{mergingEntity}-{domain}-{forEntity}_{messageType}_{version:03d}"
     ssh_data = triplets.cgmes_tools.update_filename_from_FullModel(ssh_data, filename_mask=filename_mask)
 
-    return sv_data, ssh_data
+    return sv_data, ssh_data, data
 
 
 def fix_sv_shunts(sv_data, original_data):

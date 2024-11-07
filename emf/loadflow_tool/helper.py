@@ -465,7 +465,7 @@ def generate_OPDM_ContentReference_from_filename(file_name, opdm_object_type="CG
     return template.format(**meta)
 
 
-def export_model(network: pypowsybl.network, opdm_object_meta, profiles=None):
+def export_model(network: pypowsybl.network, opdm_object_meta, profiles=None, additional_parameters: dict = None):
 
     if profiles:
         profiles = ",".join([str(profile) for profile in profiles])
@@ -473,19 +473,16 @@ def export_model(network: pypowsybl.network, opdm_object_meta, profiles=None):
         profiles = "SV,SSH,TP,EQ"
 
     file_base_name = filename_from_metadata(opdm_object_meta).split(".xml")[0]
-
-    bytes_object = network.save_to_binary_buffer(
-        format="CGMES",
-        parameters={
-            "iidm.export.cgmes.modeling-authority-set": opdm_object_meta['pmd:modelingAuthoritySet'],
-            "iidm.export.cgmes.base-name": file_base_name,
-            "iidm.export.cgmes.profiles": profiles,
-            "iidm.export.cgmes.naming-strategy": "cgmes-fix-all-invalid-ids",  # identity, cgmes, cgmes-fix-all-invalid-ids
-            "iidm.export.cgmes.export-sv-injections-for-slacks": "False",
-        })
-
+    export_parameters = {"iidm.export.cgmes.modeling-authority-set": opdm_object_meta['pmd:modelingAuthoritySet'],
+                         "iidm.export.cgmes.base-name": file_base_name,
+                         "iidm.export.cgmes.profiles": profiles,
+                         "iidm.export.cgmes.naming-strategy": "cgmes-fix-all-invalid-ids"}
+    if additional_parameters:
+        export_parameters = {**export_parameters, **additional_parameters}
+    export_format = "CGMES"
+    bytes_object = network.save_to_binary_buffer(format=export_format,
+                                                 parameters=export_parameters)
     bytes_object.name = f"{file_base_name}_{uuid.uuid4()}.zip"
-
     return bytes_object
 
 
