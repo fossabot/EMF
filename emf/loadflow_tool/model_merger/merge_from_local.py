@@ -1020,6 +1020,7 @@ def get_list_of_models_from_minio_by_timestamp_time_horizon(timestamp_to_search:
     :return filtered dataframe of profiles
     """
     minio_client = minio_client or minio.ObjectStorage()
+    default_sub_folder = sub_folder
     if time_horizon_to_search:
         sub_folder = sub_folder + '/' + time_horizon_to_search
     all_filenames = get_filename_dataframe_from_minio(minio_bucket=bucket_name,
@@ -1034,7 +1035,7 @@ def get_list_of_models_from_minio_by_timestamp_time_horizon(timestamp_to_search:
     latest_entries = (scenario_dates.groupby('Model.modelingEntity')
                       .apply(lambda x: get_latest_set_of_full_filenames(input_dataframe=x,
                                                                         reference_dataframe=all_filenames,
-                                                                        minio_sub_folder=sub_folder,
+                                                                        minio_sub_folder=default_sub_folder,
                                                                         minio_bucket=bucket_name,
                                                                         minio_client=minio_client)))
     return latest_entries
