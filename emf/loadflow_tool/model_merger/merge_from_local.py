@@ -164,8 +164,8 @@ def check_and_fix_dependencies(cgm_sv_data, cgm_ssh_data, original_data):
     return cgm_sv_data
 
 
-def get_nodes_against_kirchhoff_first_law(cgm_sv_data,
-                                          original_models,
+def get_nodes_against_kirchhoff_first_law(original_models,
+                                          cgm_sv_data: pandas.DataFrame = None,
                                           sv_injection_limit: float = SV_INJECTION_LIMIT,
                                           nodes_only: bool = False):
     """
@@ -176,8 +176,12 @@ def get_nodes_against_kirchhoff_first_law(cgm_sv_data,
     :param sv_injection_limit: threshold for deciding whether the node is violated by sum of flows
     """
     original_models = get_opdm_data_from_models(model_data=original_models)
-    # Get power flow after lf
-    power_flow = cgm_sv_data.type_tableview('SvPowerFlow')[['SvPowerFlow.Terminal', 'SvPowerFlow.p', 'SvPowerFlow.q']]
+    if isinstance(cgm_sv_data, pandas.DataFrame) and not cgm_sv_data.empty:
+        # Get power flow after lf
+        power_flow = cgm_sv_data.type_tableview('SvPowerFlow')[['SvPowerFlow.Terminal', 'SvPowerFlow.p', 'SvPowerFlow.q']]
+    else:
+        # Get power flow before lf or as is
+        power_flow = original_models.type_tableview('SvPowerFlow')[['SvPowerFlow.Terminal', 'SvPowerFlow.p', 'SvPowerFlow.q']]
     # Get terminals
     terminals = original_models.type_tableview('Terminal').rename_axis('Terminal').reset_index()
     terminals = terminals[['Terminal', 'Terminal.ConductingEquipment', 'Terminal.TopologicalNode']]
