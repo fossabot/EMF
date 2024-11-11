@@ -195,9 +195,12 @@ def get_nodes_against_kirchhoff_first_law(original_models,
                              (abs(flows_summed['SvPowerFlow.q']) > sv_injection_limit)][['Terminal.TopologicalNode']]
     if nodes_only:
         return nok_nodes
-    terminals_nodes = terminals.merge(flows_summed, on='Terminal.TopologicalNode', how='left')
-    terminals_nodes = terminals_nodes.merge(nok_nodes, on='Terminal.TopologicalNode')
-    return terminals_nodes
+    try:
+        terminals_nodes = terminals.merge(flows_summed, on='Terminal.TopologicalNode', how='left')
+        terminals_nodes = terminals_nodes.merge(nok_nodes, on='Terminal.TopologicalNode')
+        return terminals_nodes
+    except IndexError:
+        return pandas.DataFrame()
 
 
 def revert_failed_buses(cgm_sv_data,
