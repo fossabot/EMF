@@ -1,19 +1,28 @@
 import copy
+import hashlib
 import logging
 import os.path
-from datetime import datetime
+import uuid
+from datetime import datetime, timedelta
 from decimal import Decimal
+from enum import Enum
 from io import BytesIO
 from time import sleep
 from uuid import uuid4
 from zipfile import ZipFile
-from enum import Enum
 
 import pandas
 import pypowsybl.network
 import triplets.rdf_parser
 
 from aniso8601 import parse_datetime
+
+from emf.common.integrations.elastic import Elastic
+from emf.common.integrations.opdm import OPDM
+from emf.loadflow_tool.scaler import query_acnp_schedules, query_hvdc_schedules, scale_balance
+
+# from emf.loadflow_tool.scaler import query_hvdc_schedules
+
 
 try:
     from emf.common.integrations import minio
@@ -176,12 +185,13 @@ def get_nodes_against_kirchhoff_first_law(original_models,
     :param sv_injection_limit: threshold for deciding whether the node is violated by sum of flows
     """
     original_models = get_opdm_data_from_models(model_data=original_models)
-    if isinstance(cgm_sv_data, pandas.DataFrame) and not cgm_sv_data.empty:
+    if isinstance(cgm_sv_data, pandas.DataFrame):
         # Get power flow after lf
-        power_flow = cgm_sv_data.type_tableview('SvPowerFlow')[['SvPowerFlow.Terminal', 'SvPowerFlow.p', 'SvPowerFlow.q']]
+        power_flow = cgm_sv_data.type_tableview('SvPowerFlow')[['SvPowerFlow.Terminal', 'SvPowerFlow.p',
+                                                                'SvPowerFlow.q']]
     else:
-        # Get power flow before lf or as is
-        power_flow = original_models.type_tableview('SvPowerFlow')[['SvPowerFlow.Terminal', 'SvPowerFlow.p', 'SvPowerFlow.q']]
+        power_flow = original_models.type_tableview('SvPowerFlow')[['SvPowerFlow.Terminal', 'SvPowerFlow.p',
+                                                                    'SvPowerFlow.q']]
     # Get terminals
     terminals = original_models.type_tableview('Terminal').rename_axis('Terminal').reset_index()
     terminals = terminals[['Terminal', 'Terminal.ConductingEquipment', 'Terminal.TopologicalNode']]
@@ -205,10 +215,8 @@ def get_nodes_against_kirchhoff_first_law(original_models,
 
 def revert_failed_buses(cgm_sv_data,
                         original_models,
-                        failed_buses: pandas.DataFrame = None,
-                        network_instance: pypowsybl.network = None,
-                        sv_injection_limit: float = SV_INJECTION_LIMIT,
-                        revert_failed_terminals: bool = False):
+                        input_buses: pandas.DataFrame = None,
+                        revert_failed_terminals: bool = True):
     """
     Reverts back flows in terminals which are located on the buses that were not calculated.
     To revert the flows back to original state following criteria has to be met:
@@ -217,59 +225,58 @@ def revert_failed_buses(cgm_sv_data,
     3) Terminal is located in the topological node which sum of power flows differs from more than sv_injection_limit
     :param cgm_sv_data: merged SV profile (needed to set the flows for terminals)
     :param original_models: IGMs (triplets, dictionary)
-    :param failed_buses: dataframe of failed buses
-    :param network_instance: pypowsybl network instance
-    :param sv_injection_limit: threshold for deciding whether the node is violated by sum of flows
+    :param input_buses: dataframe of failed buses
     :param revert_failed_terminals: set it true to revert the flows for terminals
     :return updated merged SV and SSH profiles
     """
+    if input_buses is None or input_buses.empty:
+        return
     # Check that input is triplets
     original_models = get_opdm_data_from_models(model_data=original_models)
-    # Get terminals merged with nok nodes (see condition 2)
-    nok_nodes = get_nodes_against_kirchhoff_first_law(cgm_sv_data=cgm_sv_data,
-                                                      original_models=original_models,
-                                                      sv_injection_limit=sv_injection_limit)
-    # Filter buses that failed (see condition 1)
-    types = {'status': [get_str_from_enum(pypowsybl.loadflow.ComponentStatus.FAILED),
-                        get_str_from_enum(pypowsybl.loadflow.ComponentStatus.NO_CALCULATION)]}
-    failed_buses = failed_buses.merge(pandas.DataFrame(types), on='status')
-    if failed_buses.empty:
-        return cgm_sv_data
-    # Get terminals from network and merge them with failed buses
-    all_terminals = network_instance.get_terminals().rename_axis('Terminal.ConductingEquipment').reset_index()
-    failed_bus_terminals = all_terminals.merge(failed_buses[['id']].rename(columns={'id': 'bus_id'}), on='bus_id')
-    # Filter terminals that were in buses that failed (not calculated)
-    failed_terminals = (nok_nodes.rename(columns={'Terminal': 'SvPowerFlow.Terminal'})
-                        .merge(failed_bus_terminals, on='Terminal.ConductingEquipment'))
-    if failed_terminals.empty:
-        return cgm_sv_data
-    # Get power flow differences
-    old_power_flows = original_models.type_tableview('SvPowerFlow')[['SvPowerFlow.Terminal',
-                                                                     'SvPowerFlow.p', 'SvPowerFlow.q']]
-    new_power_flows = cgm_sv_data.type_tableview('SvPowerFlow')
-    power_flow_diff = old_power_flows.merge(new_power_flows[['SvPowerFlow.Terminal', 'SvPowerFlow.p', 'SvPowerFlow.q']],
-                                            on='SvPowerFlow.Terminal', suffixes=('_pre', '_post'))
-    power_flow_diff = power_flow_diff.merge(failed_terminals[['SvPowerFlow.Terminal', 'Terminal.TopologicalNode']],
-                                            on='SvPowerFlow.Terminal')
-    # Filter those terminals which had flows updated (see condition 3)
-    try:
-        power_flow_diff['CHANGED'] = ((abs(pandas.to_numeric(power_flow_diff['SvPowerFlow.p_pre'], errors='coerce')
-                                           - pandas.to_numeric(power_flow_diff['SvPowerFlow.p_post'], errors='coerce'))
-                                       + abs(pandas.to_numeric(power_flow_diff['SvPowerFlow.q_pre'], errors='coerce')
-                                             - (pandas.to_numeric(power_flow_diff['SvPowerFlow.q_post'],
-                                                                  errors='coerce')))) != 0)
-        power_flow_diff = power_flow_diff[power_flow_diff.eval('CHANGED')]
-    except IndexError:
-        return cgm_sv_data
-    updated_power_flows = (new_power_flows[['SvPowerFlow.Terminal', 'Type']].reset_index()
-                           .merge(power_flow_diff[['SvPowerFlow.Terminal']], on='SvPowerFlow.Terminal'))
-    updated_power_flows = updated_power_flows.merge(old_power_flows, on='SvPowerFlow.Terminal')
-    logger.error(f"Found flows for {len(power_flow_diff.index)} terminals "
-                 f"in {len(power_flow_diff['Terminal.TopologicalNode'].unique())} TNs "
-                 f"that were updated but not calculated")
+    powerflows = cgm_sv_data.type_tableview('SvPowerFlow').reset_index()
+    terminals = original_models.type_tableview('Terminal').rename_axis('SvPowerFlow.Terminal').reset_index()
+    tn_nodes = original_models.type_tableview('TopologicalNode').rename_axis('TopologicalNode').reset_index()
+    voltage_levels = original_models.type_tableview('VoltageLevel').rename_axis('VoltageLevel').reset_index()
+    voltage_nodes = (tn_nodes[['TopologicalNode', 'TopologicalNode.ConnectivityNodeContainer']]
+                     .merge(voltage_levels[['VoltageLevel']],
+                            left_on='TopologicalNode.ConnectivityNodeContainer',
+                            right_on='VoltageLevel'))
+    voltage_terminals = (terminals[['SvPowerFlow.Terminal',
+                                    'Terminal.ConductingEquipment',
+                                    'Terminal.TopologicalNode']]
+                         .merge(voltage_nodes, left_on='Terminal.TopologicalNode', right_on='TopologicalNode'))
+    voltage_terminals = voltage_terminals.drop(columns=['Terminal.TopologicalNode',
+                                                        'TopologicalNode.ConnectivityNodeContainer'])
+    failed_buses = input_buses[input_buses['status'] == 'FAILED']
+    failed_terminals = voltage_terminals.merge(failed_buses[['voltage_level_id']]
+                                               .drop_duplicates(keep='last'),
+                                               left_on='VoltageLevel',
+                                               right_on='voltage_level_id')
+
+    new_powerflows = (cgm_sv_data.type_tableview('SvPowerFlow').reset_index()
+                      .merge(failed_terminals[['SvPowerFlow.Terminal']],
+                             on='SvPowerFlow.Terminal',
+                             how='left', indicator=True))
+    new_powerflows_both = new_powerflows[new_powerflows['_merge'] == 'both']
+    fixed_powerflows = new_powerflows[new_powerflows['_merge'] == 'left_only']
+    old_powerflows = (original_models.type_tableview('SvPowerFlow').reset_index()
+                      .merge(failed_terminals[['SvPowerFlow.Terminal']],
+                             on='SvPowerFlow.Terminal',
+                             how='left', indicator=True))
+    old_powerflows_both = old_powerflows[old_powerflows['_merge'] == 'both']
+    fix_powerflows = new_powerflows_both.drop(columns=['SvPowerFlow.p', 'SvPowerFlow.q', '_merge'])
+    fix_powerflows = fix_powerflows.merge(old_powerflows_both[['SvPowerFlow.Terminal',
+                                                               'SvPowerFlow.p',
+                                                               'SvPowerFlow.q']],
+                                          on='SvPowerFlow.Terminal')
+    if not fix_powerflows.empty:
+        logger.warning(f"Found {len(fix_powerflows.index)} initialized terminals "
+                       f"on {len(failed_buses.index)} failed buses, "
+                       f"{len(fixed_powerflows.index)} are ok")
     if revert_failed_terminals:
-        logger.warning(f"Reverted flows for {len(power_flow_diff.index)} terminals")
-        cgm_sv_data = triplets.rdf_parser.update_triplet_from_tableview(cgm_sv_data, updated_power_flows)
+        logger.warning(f"Reverting {len(fix_powerflows.index)} initialized terminals on failed buses")
+        cgm_sv_data = triplets.rdf_parser.update_triplet_from_tableview(cgm_sv_data, fix_powerflows,
+                                                                        update=True, add=False)
     return cgm_sv_data
 
 
@@ -450,7 +457,7 @@ def get_str_from_enum(input_value):
         return input_value
 
 
-def get_failed_buses(load_flow_results: list, network_instance: pypowsybl.network, fail_types=None):
+def get_failed_buses(load_flow_results: list, network_instance: pypowsybl.network, fail_types: dict = None):
     """
     Gets dataframe of failed buses for postprocessing
     :param load_flow_results: list of load flow results for connected components
@@ -458,46 +465,42 @@ def get_failed_buses(load_flow_results: list, network_instance: pypowsybl.networ
     :param fail_types: list of fail types
     :return dataframe of failed buses
     """
+    all_networks = pandas.DataFrame(load_flow_results)
+    all_buses = (network_instance.get_buses().reset_index()
+                 .merge(all_networks.rename(columns={'connected_component_num': 'connected_component'}),
+                        on='connected_component'))
     if not fail_types:
-        fail_types = [get_str_from_enum(pypowsybl.loadflow.ComponentStatus.FAILED),
-                      get_str_from_enum(pypowsybl.loadflow.ComponentStatus.NO_CALCULATION),
-                      get_str_from_enum(pypowsybl.loadflow.ComponentStatus.CONVERGED),
-                      get_str_from_enum(pypowsybl.loadflow.ComponentStatus.MAX_ITERATION_REACHED),
-                      # get_str_from_enum(pypowsybl.loadflow.ComponentStatus.SOLVER_FAILED)
-                      ]
-    max_iteration = len([result for result in load_flow_results
-                         if get_str_from_enum(result['status'])
-                         == get_str_from_enum(pypowsybl.loadflow.ComponentStatus.MAX_ITERATION_REACHED)])
-    successful = len([result for result in load_flow_results
-                      if get_str_from_enum(result['status'])
-                      == get_str_from_enum(pypowsybl.loadflow.ComponentStatus.CONVERGED)])
-    not_calculated = len([result for result in load_flow_results
-                          if get_str_from_enum(result['status'])
-                          == get_str_from_enum(pypowsybl.loadflow.ComponentStatus.NO_CALCULATION)])
-    failed = len([result for result in load_flow_results
-                  if get_str_from_enum(result['status'])
-                  == get_str_from_enum(pypowsybl.loadflow.ComponentStatus.FAILED)])
-    sum_of_messages = len(load_flow_results) - successful - failed - not_calculated - max_iteration
+        fail_types = {
+            'FAILED': get_str_from_enum(pypowsybl.loadflow.ComponentStatus.FAILED),
+            'NOT CALCULATED': get_str_from_enum(pypowsybl.loadflow.ComponentStatus.NO_CALCULATION),
+            'CONVERGED': get_str_from_enum(pypowsybl.loadflow.ComponentStatus.CONVERGED),
+            'MAX_ITERATION_REACHED': get_str_from_enum(pypowsybl.loadflow.ComponentStatus.MAX_ITERATION_REACHED)
+        }
+    network_count = len(all_networks.index)
+    bus_count = len(all_buses.index)
     messages = [f"Networks: {len(load_flow_results)}"]
-    if successful:
-        messages.append(f"CONVERGED: {successful}")
-    if failed:
-        messages.append(f"INVALID: {failed}")
-    if not_calculated:
-        messages.append(f"NOT CALCULATED: {not_calculated}")
-    if max_iteration:
-        messages.append(f"MAX ITERATION: {max_iteration}")
-    if sum_of_messages:
-        messages.append(f"OTHER CRITICAL ERROR: {sum_of_messages}")
+    error_flag = False
+    for status_type in fail_types:
+        networks = len((all_networks[all_networks['status'] == fail_types[status_type]]).index)
+        buses = len(all_buses[all_buses['status'] == fail_types[status_type]].index)
+        network_count = network_count - networks
+        bus_count = bus_count - buses
+        if networks > 0:
+            if status_type == 'MAX_ITERATION_REACHED':
+                error_flag = True
+            messages.append(f"{status_type}: {networks} ({buses} buses)")
+    network_count = max(network_count, 0)
+    bus_count = max(bus_count, 0)
+    if network_count > 0:
+        error_flag = True
+        messages.append(f"OTHER CRITICAL ERROR:: {network_count} ({bus_count} buses)")
+    troublesome_buses = pandas.DataFrame([result for result in load_flow_results
+                                          if get_str_from_enum(result['status']) in fail_types.values()])
     message = '; '.join(messages)
-    if max_iteration or sum_of_messages > 0:
+    if error_flag:
         logger.error(message)
     else:
         logger.info(message)
-    troublesome_buses = pandas.DataFrame([result for result in load_flow_results
-                                          if get_str_from_enum(result['status']) in fail_types])
-
-    # troublesome_buses = pandas.concat([failed, not_calculated])
     if not troublesome_buses.empty:
         troublesome_buses = (network_instance.get_buses().reset_index()
                              .merge(troublesome_buses
@@ -533,13 +536,15 @@ def check_for_disconnected_terminals(cgm_sv_data, original_models, fix_errors: b
     return cgm_sv_data
 
 
-def check_net_interchanges(cgm_sv_data, cgm_ssh_data, original_models, fix_errors: bool = False):
+def check_net_interchanges(cgm_sv_data, cgm_ssh_data, original_models, fix_errors: bool = False,
+                           threshold: float = None):
     """
     An attempt to calculate the net interchange 2 values and check them against those provided in ssh profiles
     :param cgm_sv_data: merged sv profile
     :param cgm_ssh_data: merged ssh profile
     :param original_models: original profiles
     :param fix_errors: injects new calculated flows into merged ssh profiles
+    :param threshold: specify threshold if needed
     :return (updated) ssh profiles
     """
     original_models = get_opdm_data_from_models(model_data=original_models)
@@ -590,12 +595,20 @@ def check_net_interchanges(cgm_sv_data, cgm_ssh_data, original_models, fix_error
                              .rename_axis('ControlArea').reset_index())
         tie_flows_grouped = tie_flows_grouped.rename(columns={'SvPowerFlow.p': 'SvPowerFlow.p_post'})
     tie_flows_grouped = control_areas.merge(tie_flows_grouped, on='ControlArea')
-    tie_flows_grouped['Exceeded'] = (abs(tie_flows_grouped['ControlArea.netInterchange']
-                                         - tie_flows_grouped['SvPowerFlow.p_post']) >
-                                     tie_flows_grouped['ControlArea.pTolerance'])
+    if threshold and threshold > 0:
+        tie_flows_grouped['Exceeded'] = (abs(tie_flows_grouped['ControlArea.netInterchange']
+                                             - tie_flows_grouped['SvPowerFlow.p_post']) > threshold)
+    else:
+        tie_flows_grouped['Exceeded'] = (abs(tie_flows_grouped['ControlArea.netInterchange']
+                                             - tie_flows_grouped['SvPowerFlow.p_post']) >
+                                         tie_flows_grouped['ControlArea.pTolerance'])
     net_interchange_errors = tie_flows_grouped[tie_flows_grouped.eval('Exceeded')]
     if not net_interchange_errors.empty:
-        logger.error(f"Found {len(net_interchange_errors.index)} possible net interchange_2 problems:")
+        if threshold > 0:
+            logger.error(f"Found {len(net_interchange_errors.index)} possible net interchange_2 problems "
+                         f"over {threshold}:")
+        else:
+            logger.error(f"Found {len(net_interchange_errors.index)} possible net interchange_2 problems:")
         print(net_interchange_errors.to_string())
         if fix_errors:
             logger.warning(f"Updating {len(net_interchange_errors.index)} interchanges to new values")
@@ -642,7 +655,7 @@ def check_all_kind_of_injections(cgm_sv_data,
                                  fix_errors: bool = False,
                                  threshold: float = 0,
                                  terminals: pandas.DataFrame = None,
-                                 report_sum: bool = True, ):
+                                 report_sum: bool = True):
     """
     Compares the given cgm ssh injection values to the corresponding sv powerflow values in cgm sv
     :param cgm_sv_data: merged SV profile
@@ -709,16 +722,24 @@ def merge_models(list_of_models: list,
                  merge_prefix: str = 'CGM',
                  path_local_storage: str = None,
                  pre_sv_profile: list = None,
-                 pre_ssh_profiles: list = None):
+                 pre_ssh_profiles: list = None,
+                 use_merged_profiles: bool = False,
+                 excluded_profiles: list = None,
+                 run_scaling: bool = True):
     # Load all selected models
     input_models = list_of_models + [latest_boundary]
+
+    if use_merged_profiles:
+        input_models = input_models + pre_ssh_profiles + pre_sv_profile
+
     parameters = {
         "iidm.import.cgmes.import-node-breaker-as-bus-breaker": 'true',
     }
+    use_updated_models = False
     try:
         assembled_data = merge_functions.load_opdm_data(input_models)
         assembled_data = triplets.cgmes_tools.update_FullModel_from_filename(assembled_data)
-        if pre_sv_profile is not None and len(pre_sv_profile) > 0:
+        if pre_sv_profile is not None and len(pre_sv_profile) > 0 and not use_merged_profiles:
             assembled_sv_data = merge_functions.load_opdm_data(pre_sv_profile)
             assembled_ssh_data = merge_functions.load_opdm_data(pre_ssh_profiles)
             try:
@@ -730,7 +751,8 @@ def merge_models(list_of_models: list,
                 logger.error(f"Unable to check merged model")
             check_net_interchanges(cgm_sv_data=assembled_sv_data,
                                    cgm_ssh_data=assembled_ssh_data,
-                                   original_models=assembled_data)
+                                   original_models=assembled_data,
+                                   threshold=200)
         assembled_data = merge_functions.configure_paired_boundarypoint_injections_by_nodes(assembled_data)
         escape_upper_xml = assembled_data[assembled_data['VALUE'].astype(str).str.contains('.XML')]
         if not escape_upper_xml.empty:
@@ -754,10 +776,52 @@ def merge_models(list_of_models: list,
 
     # TODO - run other LF if default fails
     logger.info(f"Running loadflow")
-    solved_model = run_lf(merged_model, loadflow_settings=loadflow_settings.CGM_RELAXED_2)
+
+    new_settings = loadflow_settings.CGM_RELAXED_2
+    pypowsybl_folder = os.path.join(path_local_storage, 'pypowsybl_logs')
+    check_and_create_the_folder_path(pypowsybl_folder)
+    new_settings.provider_parameters['debugDir'] = pypowsybl_folder
+
+    solved_model = run_lf(merged_model, loadflow_settings=new_settings)
+
     network_itself = solved_model["network"]
+    pretty_results = pandas.DataFrame(merged_model["LOADFLOW_RESULTS"])
+    all_buses = (network_itself.get_buses()
+                 .reset_index()
+                 .merge(pretty_results.rename(columns={'connected_component_num': 'connected_component'}),
+                        on='connected_component'))
+    time_moment_now = datetime.now().strftime("%d-%m-%Y_%H-%M-%S")
+    file_name_all = f"all_buses_from_{time_moment_now}.csv"
+    if path_local_storage:
+        check_and_create_the_folder_path(path_local_storage)
+        file_name_all = path_local_storage.removesuffix('/') + '/' + file_name_all.removeprefix('/')
+    all_buses.to_csv(file_name_all)
+
     troublesome_buses = get_failed_buses(load_flow_results=merged_model["LOADFLOW_RESULTS"],
                                          network_instance=network_itself)
+
+    if run_scaling:
+        elastic_client = Elastic()
+        # area_eic_codes = elastic_client.get_data(query={"match_all": {}}, index='config-areas')
+        area_eic_codes = elastic_client.get_docs_by_query(index='config-areas', query={"match_all": {}}, size=200)
+        area_codes = area_eic_codes[['area.eic', 'area.code']].set_index('area.eic').T.to_dict('records')[0]
+        date_time_value = parse_datetime(scenario_datetime)
+        start_time = (date_time_value - timedelta(hours=0, minutes=30)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        end_time = (date_time_value + timedelta(hours=0, minutes=30)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        ac_schedules = query_acnp_schedules(process_type="A01",
+                                            utc_start=start_time,
+                                            utc_end=end_time,
+                                            area_eic_map=area_codes)
+        dc_schedules = query_hvdc_schedules(process_type="A01",
+                                            utc_start=start_time,
+                                            utc_end=end_time,
+                                            area_eic_map=area_codes)
+        solved_model["network"] = scale_balance(network=solved_model["network"],
+                                                ac_schedules=ac_schedules,
+                                                dc_schedules=dc_schedules,
+                                                lf_settings=new_settings,
+                                                debug=True)
+
     logger.info(f"Loadflow done")
 
     # TODO - get version dynamically form ELK
@@ -770,7 +834,26 @@ def merge_models(list_of_models: list,
         new_time_horizon = '01'
     # data = load_opdm_data(input_models)
     time_horizon = new_time_horizon or time_horizon
-    model_export_parameters = {}
+    seed_string = "baltic-rcc.eu"
+    some_random_hex = hashlib.md5(seed_string.encode('utf-8')).hexdigest()
+    some_random_uuid = str(uuid.UUID(hex=some_random_hex))
+    model_export_parameters = {
+        # CGM_EXPORT:
+        # Is not yet imported to pypowsybl
+        # 'iidm.export.cgmes.cgm_export': 'true',
+        # ENSURE_ID_ALIAS_UNICITY: assure that all IDS imported are unique, default: false
+        # "iidm.import.cgmes.ensure-id-alias-unicity": 'true',
+        # true by default
+        # 'iidm.export.cgmes.export-load-flow-status': 'true',
+        # EXPORT_BOUNDARY_POWER_FLOWS: Export power flows at boundary odes in SV file, default is true
+        # 'iidm.export.cgmes.export-boundary-power-flows': 'true',
+        # EXPORT_SV_INJECTIONS_FOR_SLACKS: export total mismatch from power flow calculation as a sv injection
+        # default: true
+        # 'iidm.export.cgmes.export-sv-injections-for-slacks': 'true',
+        # UPDATE_DEPENDENCIES:
+        # 'iidm.export.cgmes.update-dependencies': 'true'
+        # "iidm.export.cgmes.uuid-namespace": some_random_uuid
+    }
     sv_data, ssh_data, data = create_sv_and_updated_ssh(merged_model=solved_model,
                                                         original_models=updated_models,
                                                         scenario_date=scenario_datetime,
@@ -779,8 +862,7 @@ def merge_models(list_of_models: list,
                                                         merging_area=merging_area,
                                                         merging_entity=merging_entity,
                                                         mas=mas,
-                                                        export_parameters=model_export_parameters
-                                                        )
+                                                        export_parameters=model_export_parameters)
 
     # Fix SV
     sv_data = fix_sv_shunts(sv_data, data)
@@ -790,10 +872,9 @@ def merge_models(list_of_models: list,
     sv_data = remove_duplicate_voltage_levels_for_topological_nodes(cgm_sv_data=sv_data, original_data=data)
     sv_data = revert_failed_buses(cgm_sv_data=sv_data,
                                   original_models=data,
-                                  network_instance=network_itself,
-                                  failed_buses=troublesome_buses,
-                                  revert_failed_terminals=True)
-    sv_data = check_for_disconnected_terminals(cgm_sv_data=sv_data, original_models=data, fix_errors=True)
+                                  input_buses=troublesome_buses,
+                                  revert_failed_terminals=False)
+    # ssh_data= update_ssh_from_sv(merged_ssh_data=ssh_data, merged_sv_data=sv_data, original_models=data)
     ssh_data = check_all_kind_of_injections(cgm_ssh_data=ssh_data,
                                             cgm_sv_data=sv_data,
                                             original_models=data,
@@ -806,12 +887,21 @@ def merge_models(list_of_models: list,
                                             injection_name='ExternalNetworkInjection',
                                             fields_to_check={'SvPowerFlow.p': 'ExternalNetworkInjection.p'},
                                             fix_errors=False)
+    ssh_data = check_all_kind_of_injections(cgm_ssh_data=ssh_data,
+                                            cgm_sv_data=sv_data,
+                                            original_models=data,
+                                            injection_name='SynchronousMachine',
+                                            fields_to_check={'SvPowerFlow.p': 'RotatingMachine.p'},
+                                            fix_errors=False)
     ssh_data = check_non_boundary_equivalent_injections(cgm_sv_data=sv_data,
                                                         cgm_ssh_data=ssh_data,
-                                                        original_models=data)
+                                                        original_models=data,
+                                                        fix_errors=False)
+    sv_data = check_for_disconnected_terminals(cgm_sv_data=sv_data, original_models=data, fix_errors=True)
     try:
         ssh_data = check_net_interchanges(cgm_sv_data=sv_data, cgm_ssh_data=ssh_data, original_models=data,
-                                          fix_errors=False)
+                                          fix_errors=False,
+                                          threshold=200)
     except KeyError:
         logger.error(f"No fields for netInterchange")
     try:
@@ -832,7 +922,6 @@ def merge_models(list_of_models: list,
     # Package both input models and exported CGM profiles to in memory zip files
     serialized_data = export_to_cgmes_zip([ssh_data, sv_data])
 
-    ### Upload to OPDM ###
     if push_to_opdm:
         try:
             opdm_service = opdm.OPDM()
@@ -845,10 +934,12 @@ def merge_models(list_of_models: list,
             logging.error(f"""Unexpected error on uploading to OPDM:""", exc_info=True)
 
     # Set RMM name
-    rmm_name = f"{merge_prefix}_{time_horizon}_{version}_{parse_datetime(scenario_datetime):%Y%m%dT%H%MZ}_{merging_area}_{uuid4()}"
+    rmm_name = (f"{merge_prefix}_{time_horizon}_{version}_{parse_datetime(scenario_datetime):%Y%m%dT%H%MZ}_"
+                f"{merging_area}_{uuid4()}")
     # Exclude following profiles from the IGMS
     # excluded_profiles = ['SV', 'SSH']
-    excluded_profiles = []
+    if not excluded_profiles:
+        excluded_profiles = []
     rmm_data = BytesIO()
     with (ZipFile(rmm_data, "w") as rmm_zip):
 
@@ -881,7 +972,8 @@ def get_pf_mismatch(cgm_sv_data,
                     merged_models,
                     store_results: bool = True,
                     path_local_storage: str = None,
-                    file_name: str = "all_lines_from"):
+                    file_name: str = "all_lines_from",
+                    use_sv_injections: bool = True):
     """
     This is for debugging Kirchhoff's 1st law. Proceed with caution, have no idea what or if something here does
     something
@@ -890,6 +982,7 @@ def get_pf_mismatch(cgm_sv_data,
     :param store_results: whether to store all the lines to csv
     :param path_local_storage: where to store csv
     :param file_name: name of the file where to store the results
+    :param use_sv_injections:
     """
     # Get power flow after lf
     power_flow = cgm_sv_data.type_tableview('SvPowerFlow')
@@ -924,10 +1017,27 @@ def get_pf_mismatch(cgm_sv_data,
     # Get origins
     tsos = (merged_models.query('KEY == "Model.modelingAuthoritySet"')[['VALUE', 'INSTANCE_ID']]
             .rename(columns={'VALUE': 'modelingAuthoritySet'}))
+    voltage_levels = (merged_models.type_tableview('VoltageLevel')
+                      .rename_axis('VoltageLevel').reset_index())[['VoltageLevel', 'VoltageLevel.Substation']]
+    substations = (merged_models.type_tableview('Substation')
+                   .rename_axis('VoltageLevel.Substation')
+                   .reset_index()
+                   .rename(columns={'IdentifiedObject.name': 'Substation'}))[['VoltageLevel.Substation',
+                                                                              'Substation',
+                                                                              'Substation.Region']]
+    regions = (merged_models.type_tableview('SubGeographicalRegion')
+               .rename_axis('Substation.Region')
+               .reset_index()
+               .rename(columns={'IdentifiedObject.name': 'Region'}))[['Substation.Region', 'Region']]
+    voltage_levels = (voltage_levels.merge(substations, on='VoltageLevel.Substation')
+                      .merge(regions, on='Substation.Region'))
+    voltage_levels = voltage_levels[['VoltageLevel', 'Substation', 'Region']]
+
     topological_node_names = ((merged_models.type_tableview('TopologicalNode')
                                .rename_axis('Terminal.TopologicalNode')
                                .reset_index())
                               .rename(columns={'IdentifiedObject.name': 'TopologicalNode.name',
+                                               'TopologicalNode.EquipmentContainer': 'VoltageLevel',
                                                'IdentifiedObject.description':
                                                    'TopologicalNode.description'}))
     try:
@@ -937,9 +1047,12 @@ def get_pf_mismatch(cgm_sv_data,
                                                          'TopologicalNode.ConnectivityNodeContainer']]
     except KeyError:
         logger.error(f"TopologicalNodes are not tied to connectivityContainers")
-        topological_node_names = topological_node_names[['Terminal.TopologicalNode',
-                                                         'TopologicalNode.name',
-                                                         'TopologicalNode.description', 'ConnectivityNodeContainer']]
+        topological_node_names = ((topological_node_names[['Terminal.TopologicalNode',
+                                                           'TopologicalNode.name',
+                                                           'TopologicalNode.description',
+                                                           'ConnectivityNodeContainer']])
+                                  .rename(columns={'ConnectivityNodeContainer': 'TopologicalNode.'
+                                                                                'ConnectivityNodeContainer'}))
     all_topological_nodes = (merged_models.query('KEY=="Type" and VALUE=="TopologicalNode"')[['ID', 'INSTANCE_ID']]
                              .rename(columns={'ID': 'Terminal.TopologicalNode'}))
     all_topological_nodes = all_topological_nodes.merge(topological_node_names, on='Terminal.TopologicalNode',
@@ -948,7 +1061,12 @@ def get_pf_mismatch(cgm_sv_data,
                              .merge(tsos, on='INSTANCE_ID'))[['Terminal.TopologicalNode',
                                                               'TopologicalNode.name',
                                                               'TopologicalNode.description',
+                                                              'TopologicalNode.ConnectivityNodeContainer',
                                                               'modelingAuthoritySet']]
+    all_topological_nodes = all_topological_nodes.merge(voltage_levels,
+                                                        left_on='TopologicalNode.ConnectivityNodeContainer',
+                                                        right_on='VoltageLevel',
+                                                        how='left')
     # Calculate summed flows per topological node
     flows_summed = ((power_flow_diff.merge(terminals,
                                            left_on='SvPowerFlow.Terminal',
@@ -959,13 +1077,32 @@ def get_pf_mismatch(cgm_sv_data,
                     .rename_axis('Terminal.TopologicalNode').reset_index()
                     .rename(columns={'pre.p': 'pre.p.sum', 'pre.q': 'pre.q.sum',
                                      'post.p': 'post.p.sum', 'post.q': 'post.q.sum'}))
+    if use_sv_injections:
+        try:
+            pre_sv_injections = merged_models.type_tableview('SvInjection').rename_axis('SvInjection').reset_index()
+            post_sv_injections = cgm_sv_data.type_tableview('SvInjection').rename_axis('SvInjection').reset_index()
+            flows_summed = flows_summed.merge(pre_sv_injections[['SvInjection.TopologicalNode',
+                                                                 'SvInjection.pInjection',
+                                                                 'SvInjection.qInjection']]
+                                              .rename(
+                columns={'SvInjection.TopologicalNode': 'Terminal.TopologicalNode'}),
+                                              on='Terminal.TopologicalNode', how='left')
+            flows_summed['pre.p.sum'] = flows_summed['pre.p.sum'] + flows_summed['SvInjection.pInjection'].fillna(0)
+            flows_summed['pre.q.sum'] = flows_summed['pre.q.sum'] + flows_summed['SvInjection.qInjection'].fillna(0)
+            flows_summed = flows_summed.drop(columns=['SvInjection.pInjection', 'SvInjection.qInjection'])
+            flows_summed = flows_summed.merge(post_sv_injections[['SvInjection.TopologicalNode',
+                                                                  'SvInjection.pInjection',
+                                                                  'SvInjection.qInjection']]
+                                              .rename(
+                columns={'SvInjection.TopologicalNode': 'Terminal.TopologicalNode'}),
+                                              on='Terminal.TopologicalNode', how='left')
+            flows_summed['post.p.sum'] = flows_summed['post.p.sum'] + flows_summed['SvInjection.pInjection'].fillna(0)
+            flows_summed['post.q.sum'] = flows_summed['post.q.sum'] + flows_summed['SvInjection.qInjection'].fillna(0)
+            flows_summed = flows_summed.drop(columns=['SvInjection.pInjection', 'SvInjection.qInjection'])
+        except Exception as ex:
+            logger.error(f"Cannot use svinjections: {ex}")
     flows_summed['Flow.exceeded'] = ((abs(flows_summed['post.p.sum']) > SV_INJECTION_LIMIT) |
                                      (abs(flows_summed['post.q.sum']) > SV_INJECTION_LIMIT))
-    # Check if no Kirchhoff law violations exist in original data
-    pre_nok_nodes = flows_summed[(abs(flows_summed['pre.p.sum']) > SV_INJECTION_LIMIT) |
-                                 (abs(flows_summed['pre.q.sum']) > SV_INJECTION_LIMIT)]
-    if not pre_nok_nodes.empty:
-        print(f"{len(pre_nok_nodes.index)} topological nodes have Kirchhoff first law error")
     # Divide into ok and nok nodes
     nok_nodes_full = flows_summed[(abs(flows_summed['post.p.sum']) > SV_INJECTION_LIMIT) |
                                   (abs(flows_summed['post.q.sum']) > SV_INJECTION_LIMIT)]
@@ -1093,10 +1230,10 @@ def get_latest_set_of_full_filenames(input_dataframe,
     missing_profiles = []
     version_list = []
     for profile_type in profile_types:
-        profile = input_dataframe[input_dataframe['Model.messageType'] == profile_type]
-        if not profile.empty:
-            profile = profile[profile['Model.version'] == profile['Model.version'].max()]
-            version_list.append(profile)
+        single_profile = input_dataframe[input_dataframe['Model.messageType'] == profile_type]
+        if not single_profile.empty:
+            single_profile = single_profile[single_profile['Model.version'] == single_profile['Model.version'].max()]
+            version_list.append(single_profile)
         else:
             missing_profiles.append(profile_type)
     # if not version_list:
@@ -1138,19 +1275,25 @@ def get_latest_set_of_full_filenames(input_dataframe,
     return max_version_number
 
 
-def get_list_of_models_from_minio_by_timestamp_time_horizon(timestamp_to_search: str = '20241010T2230Z',
+def get_list_of_models_from_minio_by_timestamp_time_horizon(timestamp_to_search: str = None,
                                                             bucket_name: str = 'opdm-data',
                                                             sub_folder: str = 'CGMES',
+                                                            use_latest_scenario_date: bool = False,
                                                             minio_client: minio.ObjectStorage = None,
-                                                            time_horizon_to_search: str = '1D'):
+                                                            required_profiles: list = None,
+                                                            time_horizon_to_search: str = None,
+                                                            include_merging_agents: bool = False):
     """
     Gets the content list of minio specified by bucket and sub-folder(prefix), filters by timestamp and time horizon
     and returns dataframe consisting of paths for profiles the TSOs
     :param timestamp_to_search: scenario timestamp for the models
     :param time_horizon_to_search: time horizon for the models
+    :param required_profiles: list of profiles that should be present in a single set
     :param minio_client: instance of minio where to look additional profiles
+    :param use_latest_scenario_date:
     :param bucket_name: name of the bucket in minio where to look additional models
     :param sub_folder: prefix ot ease the search (NB! searches by modeling entity)
+    :param include_merging_agents:
     :return filtered dataframe of profiles
     """
     minio_client = minio_client or minio.ObjectStorage()
@@ -1160,36 +1303,79 @@ def get_list_of_models_from_minio_by_timestamp_time_horizon(timestamp_to_search:
     all_filenames = get_filename_dataframe_from_minio(minio_bucket=bucket_name,
                                                       sub_folder=sub_folder,
                                                       minio_client=minio_client)
-    if not all_filenames.empty and timestamp_to_search:
+    if all_filenames.empty:
+        return pandas.DataFrame()
+    if timestamp_to_search:
         scenario_dates = all_filenames[all_filenames['Model.scenarioTime'] == timestamp_to_search]
+    elif use_latest_scenario_date:
+        scenario_dates = all_filenames[all_filenames['Model.scenarioTime'] == all_filenames['Model.scenarioTime'].max()]
     else:
         scenario_dates = all_filenames
+    if not include_merging_agents:
+        scenario_dates = scenario_dates[scenario_dates['Model.mergingEntity'] == '']
     # if not scenario_dates.empty and time_horizon_to_search:
     #     scenario_dates = scenario_dates[scenario_dates['Model.processType'] == time_horizon_to_search]
     latest_entries = (scenario_dates.groupby('Model.modelingEntity')
                       .apply(lambda x: get_latest_set_of_full_filenames(input_dataframe=x,
                                                                         reference_dataframe=all_filenames,
                                                                         minio_sub_folder=default_sub_folder,
+                                                                        profile_types=required_profiles,
                                                                         minio_bucket=bucket_name,
                                                                         minio_client=minio_client)))
     return latest_entries
 
 
-def download_latest_boundary(path_to_local_storage: str):
+def download_latest_boundary(path_to_local_storage: str,
+                             bucket_name: str = 'opdm-data',
+                             sub_folder: str = 'CGMES/ENTSOE',
+                             minio_client: minio.ObjectStorage = None):
     """
     Downloads the latest boundary files to the location indicated
     :param path_to_local_storage: where to store the boundary
+    :param bucket_name: name of the bucket
+    :param sub_folder: location in minio bucket where boundary data is
+    :param minio_client: minio instance
     :return boundary profile
     """
-    boundary_data = models.get_latest_boundary()
-    components = boundary_data.get('opde:Component', [])
-    for single_component in components:
-        file_data = single_component.get('opdm:Profile', {}).get('DATA')
-        file_name = single_component.get('opdm:Profile', {}).get('pmd:fileName')
-        file_full_name = path_to_local_storage.removesuffix('/') + '/' + file_name.removeprefix('/')
-        with open(file_full_name, 'wb') as profile_to_write:
-            profile_to_write.write(file_data)
-    return boundary_data
+    if not path_to_local_storage:
+        return
+    minio_client = minio_client or minio_api.ObjectStorage()
+    boundary_file_list = get_list_of_models_from_minio_by_timestamp_time_horizon(sub_folder=sub_folder,
+                                                                                 use_latest_scenario_date=True,
+                                                                                 bucket_name=bucket_name,
+                                                                                 minio_client=minio_client,
+                                                                                 required_profiles=['EQBD', 'TPBD'])
+    download_sets_from_minio(file_list=boundary_file_list,
+                             column_name='full_path',
+                             minio_client=minio_client,
+                             bucket_name=bucket_name,
+                             full_file_path=path_to_local_storage)
+
+
+def download_sets_from_minio(file_list: pandas.DataFrame,
+                             column_name: str = 'full_path',
+                             minio_client: minio.ObjectStorage = None,
+                             bucket_name: str = 'opdm-data',
+                             full_file_path: str = None):
+    """
+    Downloads files from mino using paths from dataframe to location indicated
+    :param file_list: dataframe containing profile data
+    :param column_name: name of the column where paths are located
+    :param minio_client: minio client if set
+    :param bucket_name: name of the bucket where profiles are
+    :param full_file_path: local folder path
+    """
+    if file_list is None or file_list.empty or not full_file_path:
+        return
+    minio_client = minio_client or minio.ObjectStorage()
+    for single_path in file_list[column_name]:
+        model_data = minio_client.download_object(bucket_name, single_path)
+        if model_data:
+            model_data_name = os.path.basename(single_path)
+            full_file_name = full_file_path.removesuffix('/') + '/' + str(model_data_name).removeprefix('/')
+            with open(full_file_name, 'wb') as profile_to_write:
+                profile_to_write.write(model_data)
+            logger.info(f"{single_path} is downloaded to {full_file_path}")
 
 
 def download_models_from_minio_to_local_storage(path_to_local_storage: str,
@@ -1217,7 +1403,9 @@ def download_models_from_minio_to_local_storage(path_to_local_storage: str,
     if sub_folder is None:
         sub_folder = parse_datetime(timestamp)
         sub_folder = sub_folder.strftime('%Y-%m-%d-%H-%M')
-        sub_folder = f"{sub_folder}Z-{time_horizon}"
+        sub_folder = f"{sub_folder}Z"
+        if time_horizon:
+            sub_folder = f"{sub_folder}-{time_horizon}"
     full_file_path = path_to_local_storage.removesuffix('/') + '/' + sub_folder.removeprefix('/')
     check_and_create_the_folder_path(full_file_path)
     if len(os.listdir(full_file_path)) > 0:
@@ -1227,92 +1415,70 @@ def download_models_from_minio_to_local_storage(path_to_local_storage: str,
                                                                         sub_folder=minio_prefix,
                                                                         time_horizon_to_search=time_horizon,
                                                                         minio_client=minio_client)
-    for single_path in file_list['full_path']:
-        print(single_path)
-        model_data = minio_client.download_object(bucket_name, single_path)
-        if model_data:
-            model_data_name = os.path.basename(single_path)
-            full_file_name = full_file_path.removesuffix('/') + '/' + model_data_name.removeprefix('/')
-            with open(full_file_name, 'wb') as profile_to_write:
-                profile_to_write.write(model_data)
-    download_latest_boundary(path_to_local_storage=full_file_path)
+    download_sets_from_minio(file_list=file_list,
+                             column_name='full_path',
+                             minio_client=minio_client,
+                             bucket_name=bucket_name,
+                             full_file_path=full_file_path)
+    download_latest_boundary(path_to_local_storage=full_file_path,
+                             minio_client=minio_client,
+                             bucket_name=bucket_name,
+                             sub_folder=minio_prefix.removesuffix('/') + '/' + 'ENTSOE')
     return os.path.normpath(full_file_path)
 
 
-if __name__ == '__main__':
-    import sys
-    where_to_store_stuff = r'/CGM_dump'
-    this_run = datetime.now().strftime("%d-%m-%Y_%H-%M-%S")
-    where_to_store_stuff = os.path.join(where_to_store_stuff, this_run)
-
-    logging.basicConfig(
-        format='%(levelname)-10s %(asctime)s.%(msecs)03d %(name)-30s %(funcName)-35s %(lineno)-5d: %(message)s',
-        datefmt='%Y-%m-%dT%H:%M:%S',
-        level=logging.INFO,
-        handlers=[logging.StreamHandler(sys.stdout),
-                  # Comment this block ini if pypowsybl logs are needed
-                  # PyPowsyblLogGatheringHandler(topic_name='cgm_merge',
-                  #                              send_to_elastic=False,
-                  #                              upload_to_minio=False,
-                  #                              logging_policy=PyPowsyblLogReportingPolicy.ALL_ENTRIES,
-                  #                              print_to_console=False,
-                  #                              path_to_local_folder=where_to_store_stuff,
-                  #                              report_level=logging.ERROR)
-                  ])
-    # Set this true if local files are used, if this is false then it takes the values in test_scenario_datetime_values
-    # and asks them from ELK+Minio
-    use_local = True
-    # Set this true to if running through validator is needed
-    validation_needed = False
-    # If result should be sent to opdm
-    send_to_opdm = False
-    examples_path = None
-    time_stamp_to_study = '20241025T1530Z'
-    time_horizon_to_study = '1D'
-    main_folder_to_study = r'/IGMS'
-    folder_to_study = download_models_from_minio_to_local_storage(timestamp=time_stamp_to_study,
-                                                                  time_horizon=time_horizon_to_study,
-                                                                  # sub_folder='202410251630',
-                                                                  path_to_local_storage=main_folder_to_study)
-    test_time_horizon = 'ID'
-    load_in_merged_model = True
-    # Specify TSOs who should be excluded, if empty then none is excluded
-    included_models = [
-    ]
-    # if models are taken from ELK+Minio (use_local = False), specify additional TSOs that should be searched from Minio
-    # directly (synchro models)
-    excluded_models = [
-    ]
-
-    all_boundaries = None
-    # if models are taken from ELK+Minio (use_local = False), specify additional TSOs that should be searched from Minio
-    # directly (synchro models)
-    local_import_models = []
-    # If use_local = True and this is True then it takes scenario date, time horizon from the file names of the IGMs
+def run_some_function(time_stamp_name: str,
+                      time_horizon_name: str = None,
+                      included_models: list = None,
+                      excluded_models: list = None,
+                      igms_folder: str = r'E:\margus.ratsep\IGMS',
+                      bucket_name: str = None,
+                      minio_prefix: str = None,
+                      load_in_merged_model: bool = False,
+                      test_version: str = '012',
+                      test_merging_entity: str = 'BALTICRSC',
+                      test_merging_area: str = 'EU',
+                      send_to_opdm: bool = False,
+                      test_mas: str = 'http://www.baltic-rsc.eu/OperationalPlanning/CGM',
+                      use_local: bool = True,
+                      special_boundary_loc: str = None,
+                      use_time_scenario: bool = False,
+                      output_folder: str = None,
+                      minio_import_models: list = None,
+                      validation_needed: bool = False,
+                      folder_to_study: str = None,
+                      run_scaling: bool = True,
+                      test_scenario_datetime_values: list = None,
+                      excluded_profiles:list = None
+                      ):
+    if not folder_to_study:
+        folder_to_study = download_models_from_minio_to_local_storage(timestamp=time_stamp_name,
+                                                                      time_horizon=time_horizon_name,
+                                                                      # sub_folder='202410251630',
+                                                                      minio_prefix=minio_prefix,
+                                                                      bucket_name=bucket_name,
+                                                                      path_to_local_storage=igms_folder)
     overwrite_local_date_time = True
-    test_scenario_datetime_values = ['2024-08-01T12:30:00+00:00']
-    # Specify some additional parameters
-    test_version = '118'
-    test_merging_entity = 'BALTICRCC'
-    test_merging_area = 'EU'
-    test_mas = 'http://www.baltic-rsc.eu/OperationalPlanning/CGM'
-    # test_merging_area = 'BA'
-    # test_mas = 'http://www.baltic-rsc.eu/OperationalPlanning/RMM'
+    if not test_scenario_datetime_values:
+        test_scenario_datetime_values = ['2024-08-01T12:30:00+00:00']
+    test_time_horizon = 'ID'
+    examples_path = None
     for test_scenario_datetime in test_scenario_datetime_values:
         logger.info(f"Executing {test_scenario_datetime}")
         merged_ssh_profiles = []
         merged_sv_profiles = []
+        time_scenario_val = test_scenario_datetime if use_time_scenario else None
+        boundary_folder = special_boundary_loc or folder_to_study
         if use_local:
-            loaded_boundary = file_system.get_latest_boundary(path_to_directory=folder_to_study,
+            loaded_boundary = file_system.get_latest_boundary(path_to_directory=boundary_folder,
                                                               local_folder_for_examples=examples_path)
-            valid_models = file_system.get_latest_models_and_download(path_to_directory=folder_to_study,
-                                                                      local_folder_for_examples=examples_path)
             if load_in_merged_model:
-                valid_models = file_system.get_latest_models_and_download(path_to_directory=folder_to_study,
-                                                                          local_folder_for_examples=examples_path,
-                                                                          allow_merging_entities=True)
-                for model in valid_models:
-                    merged_sv_component = None
+                combined_models = file_system.get_latest_models_and_download(path_to_directory=folder_to_study,
+                                                                             scenario_date=time_scenario_val,
+                                                                             bypass_profiles=['EQ'],
+                                                                             local_folder_for_examples=examples_path,
+                                                                             allow_merging_entities=True)
+                for model in combined_models:
                     merged_ssh_component = None
                     for component in model.get('opde:Component', {}):
                         if component.get('opdm:Profile', {}).get('pmd:mergingEntity'):
@@ -1325,11 +1491,11 @@ if __name__ == '__main__':
                         model.get('opde:Component', {}).remove(merged_ssh_component)
                         copied_model['opde:Component'] = [merged_ssh_component]
                         merged_ssh_profiles.append(copied_model)
-                valid_models = [model for model in valid_models if model not in merged_sv_profiles]
+                valid_models = [model for model in combined_models if model not in merged_sv_profiles]
 
             else:
-
                 valid_models = file_system.get_latest_models_and_download(path_to_directory=folder_to_study,
+                                                                          scenario_date=time_scenario_val,
                                                                           local_folder_for_examples=examples_path)
 
             if overwrite_local_date_time:
@@ -1339,6 +1505,8 @@ if __name__ == '__main__':
                     test_time_horizon = 'ID'
         else:
             loaded_boundary = models.get_latest_boundary()
+            # opdm_client = OPDM()
+            # valid_models = opdm_client.get_latest_models_and_download(test_time_horizon, test_scenario_datetime)
             valid_models = models.get_latest_models_and_download(test_time_horizon, test_scenario_datetime, valid=True)
             validation_needed = False
 
@@ -1346,18 +1514,17 @@ if __name__ == '__main__':
         filtered_models = filter_models(valid_models, included_models, excluded_models, filter_on='pmd:TSO')
 
         # Get additional models directly from Minio
-        if local_import_models and not use_local:
+        if minio_import_models:
             minio_service = minio_api.ObjectStorage()
             additional_models = minio_service.get_latest_models_and_download(time_horizon=test_time_horizon,
                                                                              scenario_datetime=test_scenario_datetime,
-                                                                             model_entity=local_import_models,
+                                                                             model_entity=minio_import_models,
                                                                              bucket_name=INPUT_MINIO_BUCKET,
                                                                              prefix=INPUT_MINIO_FOLDER)
             test_input_models = filtered_models + additional_models
         else:
             test_input_models = filtered_models
 
-        # SET BRELL LINE VALUES
         available_models = []
         invalid_models = []
         if validation_needed:
@@ -1369,7 +1536,7 @@ if __name__ == '__main__':
                         available_models.append(model)
                     else:
                         invalid_models.append(model)
-                except:
+                except Exception:
                     invalid_models.append(model)
                     logger.error("Validation failed")
             [print(dict(tso=model['pmd:TSO'], valid=model.get('VALIDATION_STATUS', {}).get('valid'),
@@ -1387,21 +1554,134 @@ if __name__ == '__main__':
                                   scenario_datetime=test_scenario_datetime,
                                   merging_area=test_merging_area,
                                   merging_entity=test_merging_entity,
-                                  path_local_storage=where_to_store_stuff,
+                                  path_local_storage=output_folder,
                                   mas=test_mas,
                                   version=test_version,
                                   push_to_opdm=send_to_opdm,
                                   pre_sv_profile=merged_sv_profiles,
-                                  pre_ssh_profiles=merged_ssh_profiles
+                                  pre_ssh_profiles=merged_ssh_profiles,
+                                  use_merged_profiles=False,
+                                  run_scaling=run_scaling,
+                                  excluded_profiles=excluded_profiles
                                   )
 
-        check_and_create_the_folder_path(where_to_store_stuff)
-        full_name = where_to_store_stuff.removesuffix('/') + '/' + test_model.name.removeprefix('/')
+        check_and_create_the_folder_path(output_folder)
+        full_name = output_folder.removesuffix('/') + '/' + test_model.name.removeprefix('/')
         with open(full_name, 'wb') as write_file:
             write_file.write(test_model.getbuffer())
-        # test_model.name = 'EMF_test_merge_find_better_place/CGM/' + test_model.name
-        # save_minio_service = minio.ObjectStorage()
-        # try:
-        #     save_minio_service.upload_object(test_model, bucket_name=OUTPUT_MINIO_BUCKET)
-        # except:
-        #     logging.error(f"""Unexpected error on uploading to Object Storage:""", exc_info=True)
+
+
+if __name__ == '__main__':
+    import sys
+
+    where_to_store_stuff = r'C:\where_all_output_goes'
+    this_run = datetime.now().strftime("%d-%m-%Y_%H-%M-%S")
+    where_to_store_stuff = os.path.join(where_to_store_stuff, this_run)
+
+    logging.basicConfig(
+        format='%(levelname)-10s %(asctime)s.%(msecs)03d %(name)-30s %(funcName)-35s %(lineno)-5d: %(message)s',
+        datefmt='%Y-%m-%dT%H:%M:%S',
+        level=logging.INFO,
+        handlers=[logging.StreamHandler(sys.stdout),
+                  PyPowsyblLogGatheringHandler(topic_name='cgm_merge',
+                                               send_to_elastic=False,
+                                               upload_to_minio=False,
+                                               logging_policy=PyPowsyblLogReportingPolicy.ALL_ENTRIES,
+                                               print_to_console=False,
+                                               path_to_local_folder=where_to_store_stuff,
+                                               report_level=logging.ERROR)]
+    )
+    # Specify some timestamps
+    timestamps = [
+        '20241122T0030Z',
+        '20241122T0130Z',
+        '20241122T0230Z',
+        '20241122T0330Z',
+        '20241122T0430Z',
+        '20241122T0530Z',
+        '20241122T0630Z',
+        '20241122T0730Z',
+        '20241122T0830Z',
+        '20241122T0930Z',
+        '20241122T1030Z',
+        '20241122T1130Z',
+        '20241122T1230Z',
+        '20241122T1330Z',
+        '20241122T1430Z',
+        '20241122T1530Z',
+        '20241122T1630Z',
+        '20241122T1730Z',
+        '20241122T1830Z',
+        '20241122T1930Z',
+        '20241122T2030Z',
+        '20241122T2130Z',
+        '20241122T2230Z',
+    ]
+    # either found igms are filtered by scenario date time, useful if folder consists of several timestamps
+    use_scenario_for_filtering = True
+    # Specify tsos to be included
+    included_tsos = []
+    # Specify tsos to be excluded
+    excluded_tsos = []
+    # Excplitly specify where igms are (if set then looks there and doesn't download if anything was found(
+    igm_folder_to_study = r'C:\folder_where_input_igms_exists'
+    # Bucket name in Minio
+    igm_bucket_name = 'opdm-data'
+    # Path in minio for models to ease the search
+    igm_minio_prefix = "CGMES"
+    # Either to load and use already merged model, weird stuff can happen
+    use_merged_model = False
+    # time horizon
+    time_horizon = '1D'
+    # if igm_folder_to_study is None then it parses scenario date time to year-month-date-hour-minute-time_horizon
+    # searches it in this folder, checks if it has content and if not then goes to PDN and starts download everything
+    # that meets the criteria
+    folder_where_to_store_igms = r'C:\where_to_store_igms_from_pdn'
+    # Speify version number
+    version_number = '001'
+    # CGM related variables
+    merging_entity = 'BALTICRSC'
+    mas = 'http://www.baltic-rsc.eu/OperationalPlanning/CGM'
+    merging_area = 'BA'
+    # Specify tsos to be downloaded from minio
+    minio_models = None
+    # Run through the validation pipeline
+    validate_models = False
+    # Apply scaling
+    scale_models = False
+    # Send output to opdm
+    send_cgm_to_opdm = False
+    # Merge files from local storage
+    use_local_files = True
+    # if boundary is not in same folder with igms specify the location explicitly
+    boundary_location = None
+    # specify igm profiles to be excluded in final cgm (for example duplicate SSH, SV(
+    exclude_igm_profiles_in_cgm = []
+    for time_stamp_to_study in timestamps:
+        run_some_function(time_stamp_name=time_stamp_to_study,
+                          time_horizon_name=time_horizon,
+                          included_models=included_tsos,
+                          excluded_models=excluded_tsos,
+                          igms_folder=folder_where_to_store_igms,
+                          bucket_name=igm_bucket_name,
+                          minio_prefix=igm_minio_prefix,
+                          load_in_merged_model=use_merged_model,
+                          test_version=version_number,
+                          test_merging_entity=merging_entity,
+                          test_merging_area=merging_area,
+                          test_mas=mas,
+                          send_to_opdm=send_cgm_to_opdm,
+                          use_local=use_local_files,
+                          special_boundary_loc=boundary_location,
+                          use_time_scenario=use_scenario_for_filtering,
+                          test_scenario_datetime_values=[time_stamp_to_study],
+                          output_folder=where_to_store_stuff,
+                          minio_import_models=minio_models,
+                          validation_needed=validate_models,
+                          folder_to_study=igm_folder_to_study,
+                          run_scaling=scale_models,
+                          excluded_profiles=exclude_igm_profiles_in_cgm
+                          )
+
+
+
