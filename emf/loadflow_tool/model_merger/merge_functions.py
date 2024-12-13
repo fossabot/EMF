@@ -494,9 +494,9 @@ def generate_merge_report(merged_model, input_models, merge_data):
             island['slack_bus_region'] = ''
 
         network_balance = {"generation_p": float(generation_by_component.loc[island['connected_component_num']].p),
-                           "load_p": float(load_by_component.loc[island['connected_component_num']].p),
+                           "load_p": float(load_by_component.loc[island['connected_component_num']].p) if island['connected_component_num'] in load_by_component.index else float(0),
                            "generation_q": float(generation_by_component.loc[island['connected_component_num']].q),
-                           "load_q": float(load_by_component.loc[island['connected_component_num']].q),
+                           "load_q": float(load_by_component.loc[island['connected_component_num']].q) if island['connected_component_num'] in load_by_component.index else float(0),
                            "buses": int(buses_by_component.loc[island['connected_component_num']]),
                            "branches": int(branches_by_component.loc[island['connected_component_num']]),
                            }
@@ -648,10 +648,12 @@ def remove_duplicate_sv_voltages(cgm_sv_data, original_data):
     # Just in case convert the values to numeric
     sv_voltage_values[['SvVoltage.v']] = (sv_voltage_values[['SvVoltage.v']].apply(lambda x: x.apply(Decimal)))
     # Group by topological node id and by some logic take SvVoltage that will be dropped
-    voltages_to_discard = (sv_voltage_values.groupby(['SvVoltage.SvTopologicalNode']).
-                           apply(lambda x: take_best_match_for_sv_voltage(input_data=x,
-                                                                          column_name='SvVoltage.v',
-                                                                          to_keep=False), include_groups=False))
+    voltages_to_keep = (sv_voltage_values.groupby(['SvVoltage.SvTopologicalNode']).
+                        apply(lambda x: take_best_match_for_sv_voltage(input_data=x,
+                                                                       column_name='SvVoltage.v',
+                                                                       to_keep=True), include_groups=False))
+    voltages_to_discard = sv_voltage_values.merge(voltages_to_keep['ID'], on='ID', how='left', indicator=True)
+    voltages_to_discard = voltages_to_discard[voltages_to_discard['_merge'] == 'left_only']
     if not voltages_to_discard.empty:
         logger.info(f"Removing {len(voltages_to_discard.index)} duplicate voltage levels from boundary nodes")
         sv_voltages_to_remove = pandas.merge(cgm_sv_data, voltages_to_discard['ID'].to_frame(), on='ID')
@@ -797,9 +799,9 @@ def set_brell_lines_to_zero_in_models(opdm_models, magic_brell_lines: dict = Non
                 repackage_needed = True
                 logger.info(f"Setting brell line {line} EquivalentInjection.p and EquivalentInjection.q to 0")
                 profile.loc[
-                    profile.query(f"ID == '{line_id}' and KEY == 'EquivalentInjection.p'").index, "VALUE"] = 0
+                    profile.query(f"ID == '{line_id}' and KEY == 'EquivalentInjection.p'").index, "VALUE"] = str(0)
                 profile.loc[
-                    profile.query(f"ID == '{line_id}' and KEY == 'EquivalentInjection.q'").index, "VALUE"] = 0
+                    profile.query(f"ID == '{line_id}' and KEY == 'EquivalentInjection.q'").index, "VALUE"] = str(0)
         if repackage_needed:
             profile = triplets.cgmes_tools.update_FullModel_from_filename(profile)
             serialized_data = export_to_cgmes_zip([profile])
@@ -811,6 +813,40 @@ def set_brell_lines_to_zero_in_models(opdm_models, magic_brell_lines: dict = Non
                         model_profile['opdm:Profile']['DATA'] = serialized.read()
 
     return opdm_models
+
+
+def set_brell_lines_to_zero_in_models_new(assembled_data, magic_brell_lines: dict = None, profile_to_change: str = "SSH"):
+    """
+    Sets p and q of given  (BRELL) lines to zero
+    Copied from emf_python as is
+    Workflow:
+    1) Take models (in cgmes format)
+    2) parse profile ("SSH") to triplets
+    3) Check and set the BRELL lines
+    4) if lines were set, repackage from triplets to CGMES and replace it in given profile
+    5) return models (losses: ""->'' in header, tab -> double space, closing tags -> self-closing tags if empty)
+    Note that in test run only one of them: L309 was present in AST
+    :param opdm_models: list of opdm models
+    :param magic_brell_lines: dictionary of brell lines
+    :param profile_to_change: profile to change
+    """
+    if not magic_brell_lines:
+        magic_brell_lines = {'L373': 'cf3af93a-ad15-4db9-adc2-4e4454bb843f',
+                             'L374': 'd98ec0d4-4e25-4667-b21f-5b816a6e8871',
+                             'L358': 'e0786c57-57ff-454e-b9e2-7a912d81c674',
+                             'L309': '7bd0deae-f000-4b15-a24d-5cf30765219f'}
+
+    for line, line_id in magic_brell_lines.items():
+        if assembled_data.query(f"ID == '{line_id}'").empty:
+            logger.info(f"Skipping brell line {line} as it was not found in data")
+        else:
+            logger.info(f"Setting brell line {line} EquivalentInjection.p and EquivalentInjection.q to 0")
+            assembled_data.loc[
+                assembled_data.query(f"ID == '{line_id}' and KEY == 'EquivalentInjection.p'").index, "VALUE"] = 0
+            assembled_data.loc[
+                assembled_data.query(f"ID == '{line_id}' and KEY == 'EquivalentInjection.q'").index, "VALUE"] = 0
+
+    return assembled_data
 
 
 if __name__ == "__main__":
