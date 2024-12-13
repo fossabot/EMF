@@ -35,9 +35,11 @@ import pypowsybl as pp
 import logging
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
+from aniso8601 import parse_datetime
 from typing import Dict, List, Union
 import config
+from emf.common.integrations.elastic import Elastic
 from emf.common.config_parser import parse_app_properties
 from emf.common.decorators import performance_counter
 from emf.common.integrations import elastic
@@ -660,6 +662,35 @@ if __name__ == "__main__":
                                      dc_schedules=test_dc_schedules, debug=True)
     print("Done")
     # print(network_instance.ac_scaling_results_df)
+
+    # Set-up
+    process_type = 'A01'
+    elastic_client = Elastic()
+    scenario_datetime = "20241212T2230Z"
+    solved_model = {}
+    # area_eic_codes = elastic_client.get_data(query={"match_all": {}}, index='config-areas')
+    area_eic_codes = elastic_client.get_docs_by_query(index='config-areas', query={"match_all": {}}, size=200)
+    area_codes = area_eic_codes[['area.eic', 'area.code']].set_index('area.eic').T.to_dict('records')[0]
+    date_time_value = parse_datetime(scenario_datetime)
+    start_time = (date_time_value - timedelta(hours=0, minutes=30)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    end_time = (date_time_value + timedelta(hours=0, minutes=30)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    ac_schedules = query_acnp_schedules(process_type=process_type,
+                                        utc_start=start_time,
+                                        utc_end=end_time,
+                                        area_eic_map=area_codes)
+    dc_schedules = query_hvdc_schedules(process_type=process_type,
+                                        utc_start=start_time,
+                                        utc_end=end_time,
+                                        area_eic_map=area_codes)
+    solved_model["network"] = scale_balance(network=solved_model.get("network"),
+                                            ac_schedules=ac_schedules,
+                                            dc_schedules=dc_schedules,
+                                            lf_settings=CGM_RELAXED_1,
+                                            area_eic_map=area_eic_codes,
+                                            models=None,
+                                            abort_when_diverged=True,
+                                            scale_by_regions=True,
+                                            debug=True)
 
     # Results analysis
     # print(network.ac_scaling_results_df.query("KEY == 'generation'"))
