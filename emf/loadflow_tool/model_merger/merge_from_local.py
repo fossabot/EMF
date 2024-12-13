@@ -736,6 +736,7 @@ def merge_models(list_of_models: list,
         "iidm.import.cgmes.import-node-breaker-as-bus-breaker": 'true',
     }
     use_updated_models = False
+    assembled_data = None
     try:
         assembled_data = merge_functions.load_opdm_data(input_models)
         assembled_data = triplets.cgmes_tools.update_FullModel_from_filename(assembled_data)
@@ -768,7 +769,7 @@ def merge_models(list_of_models: list,
                                                                              )
 
         updated_models = create_opdm_objects([merge_functions.export_to_cgmes_zip([assembled_data])])
-        del assembled_data
+        assembled_data
     except KeyError as error:
         updated_models = input_models
         logger.error(f"Unable to preprocess: {error}")
@@ -799,8 +800,14 @@ def merge_models(list_of_models: list,
 
     troublesome_buses = get_failed_buses(load_flow_results=merged_model["LOADFLOW_RESULTS"],
                                          network_instance=network_itself)
-
-    if run_scaling:
+    process_types_known = {'1D': 'A01', 'ID': 'A18'}
+    process_type = process_types_known.get(time_horizon)
+    data = None
+    if run_scaling and process_type:
+        if isinstance(assembled_data, pandas.DataFrame) and assembled_data is not None:
+            data = assembled_data
+        else:
+            data = get_opdm_data_from_models(model_data=updated_models)
         elastic_client = Elastic()
         # area_eic_codes = elastic_client.get_data(query={"match_all": {}}, index='config-areas')
         area_eic_codes = elastic_client.get_docs_by_query(index='config-areas', query={"match_all": {}}, size=200)
@@ -808,11 +815,11 @@ def merge_models(list_of_models: list,
         date_time_value = parse_datetime(scenario_datetime)
         start_time = (date_time_value - timedelta(hours=0, minutes=30)).strftime('%Y-%m-%dT%H:%M:%SZ')
         end_time = (date_time_value + timedelta(hours=0, minutes=30)).strftime('%Y-%m-%dT%H:%M:%SZ')
-        ac_schedules = query_acnp_schedules(process_type="A01",
+        ac_schedules = query_acnp_schedules(process_type=process_type,
                                             utc_start=start_time,
                                             utc_end=end_time,
                                             area_eic_map=area_codes)
-        dc_schedules = query_hvdc_schedules(process_type="A01",
+        dc_schedules = query_hvdc_schedules(process_type=process_type,
                                             utc_start=start_time,
                                             utc_end=end_time,
                                             area_eic_map=area_codes)
@@ -820,6 +827,12 @@ def merge_models(list_of_models: list,
                                                 ac_schedules=ac_schedules,
                                                 dc_schedules=dc_schedules,
                                                 lf_settings=new_settings,
+                                                # area_eic_map=area_eic_codes,
+                                                # models=data,
+                                                area_eic_map=None,
+                                                models=None,
+                                                abort_when_diverged=True,
+                                                scale_by_regions=False,
                                                 debug=True)
 
     logger.info(f"Loadflow done")
@@ -1591,31 +1604,31 @@ if __name__ == '__main__':
                                                path_to_local_folder=where_to_store_stuff,
                                                report_level=logging.ERROR)]
     )
-    # Specify some timestamps
+    # Specify some timestamps, at least one has to be in order for the loop to work
     timestamps = [
         '20241122T0030Z',
-        '20241122T0130Z',
-        '20241122T0230Z',
-        '20241122T0330Z',
-        '20241122T0430Z',
-        '20241122T0530Z',
-        '20241122T0630Z',
-        '20241122T0730Z',
-        '20241122T0830Z',
-        '20241122T0930Z',
-        '20241122T1030Z',
-        '20241122T1130Z',
-        '20241122T1230Z',
-        '20241122T1330Z',
-        '20241122T1430Z',
-        '20241122T1530Z',
-        '20241122T1630Z',
-        '20241122T1730Z',
-        '20241122T1830Z',
-        '20241122T1930Z',
-        '20241122T2030Z',
-        '20241122T2130Z',
-        '20241122T2230Z',
+        # '20241122T0130Z',
+        # '20241122T0230Z',
+        # '20241122T0330Z',
+        # '20241122T0430Z',
+        # '20241122T0530Z',
+        # '20241122T0630Z',
+        # '20241122T0730Z',
+        # '20241122T0830Z',
+        # '20241122T0930Z',
+        # '20241122T1030Z',
+        # '20241122T1130Z',
+        # '20241122T1230Z',
+        # '20241122T1330Z',
+        # '20241122T1430Z',
+        # '20241122T1530Z',
+        # '20241122T1630Z',
+        # '20241122T1730Z',
+        # '20241122T1830Z',
+        # '20241122T1930Z',
+        # '20241122T2030Z',
+        # '20241122T2130Z',
+        # '20241122T2230Z',
     ]
     # either found igms are filtered by scenario date time, useful if folder consists of several timestamps
     use_scenario_for_filtering = True

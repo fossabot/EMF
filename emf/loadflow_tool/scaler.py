@@ -634,7 +634,7 @@ if __name__ == "__main__":
         handlers=[logging.StreamHandler(sys.stdout)]
     )
 
-    model_path = r"C:\Users\martynas.karobcikas\Documents\models\rmm\test_model_ast_litgrid.zip"
+    model_path = r"C:\Users\some-user\Documents\models\rmm\test_model_ast_litgrid.zip"
     network = pp.network.load(model_path, parameters={"iidm.import.cgmes.source-for-iidm-id": "rdfID"})
 
     # Query target schedules
