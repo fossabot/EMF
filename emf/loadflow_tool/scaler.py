@@ -698,4 +698,5 @@ if __name__ == "__main__":
     # print(network.ac_scaling_results_df.query("KEY == 'offset-acnp'"))
 
     # Other examples
-    # loads = network.get_loads(id=network.get_elements_ids(element_type=pp.network.ElementType.LOAD, countries=['LT'])) 
+    # loads = network.get_loads(id=network.get_elements_ids(element_type=pp.network.ElementType.LOAD, countries=['LT']))
+    
